@@ -1,0 +1,30 @@
+{
+  "host": "bernedoodle.aternos.host",
+  "port": 44640,
+  "bedrockHost": "bernedoodle.aternos.me",
+  "bedrockPort": 19132,
+  "username": "AFK_Bot",
+  "version": "auto",
+  "auth": "offline",
+  "checkTimeoutMs": 45000,
+  "connectTimeoutMs": 60000,
+  "reconnect": {
+    "enabled": true,
+    "initialDelayMs": 5000,
+    "maxDelayMs": 120000,
+    "multiplier": 1.75,
+    "jitterMs": 2000
+  },
+  "antiIdle": {
+    "enabled": true,
+    "intervalMs": 90000,
+    "maxYawDeltaDeg": 12,
+    "movement": false
+  },
+  "logging": {
+    "level": "info",
+    "file": "logs/bot.log",
+    "jsonl": "logs/bot.jsonl",
+    "statusFile": "logs/status.json"
+  }
+}
