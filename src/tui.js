@@ -182,13 +182,11 @@ class Tui {
     this.message = { text: 'connecting to daemon…', until: Date.now() + 4000 };
     this.scheduleRender();
 
-    await this.connectOrSpawnDaemon();
-
-    // periodic polls: status 1s, radar 1.2s
-    this._timers.push(setInterval(() => this.pollStatus(), 1000));
-    this._timers.push(setInterval(() => { if (this.radarOn) this.pollRadar(); }, 1200));
-    this._timers.push(setInterval(() => { if (this.shotProgress || this.daemonState === 'connecting') this.scheduleRender(); }, 400));
-
+    // Input must be wired BEFORE the connect attempt. That attempt can block for
+    // many seconds (it spawns a daemon and retries), and in raw mode the
+    // terminal swallows keystrokes that have no listener yet — a user who
+    // launches the TUI with no daemon running would otherwise sit in front of a
+    // dashboard that ignores Ctrl-C, q and Escape until the retries finish.
     if (process.stdin.isTTY) {
       process.stdin.on('data', (d) => this.onKey(d));
       process.stdin.on('error', () => {});
@@ -198,6 +196,13 @@ class Tui {
     }
     process.on('SIGINT', () => { /* Ctrl-C handled in onKey */ this.quit(false); });
     process.on('SIGTERM', () => this.quit(false));
+
+    await this.connectOrSpawnDaemon();
+
+    // periodic polls: status 1s, radar 1.2s
+    this._timers.push(setInterval(() => this.pollStatus(), 1000));
+    this._timers.push(setInterval(() => { if (this.radarOn) this.pollRadar(); }, 1200));
+    this._timers.push(setInterval(() => { if (this.shotProgress || this.daemonState === 'connecting') this.scheduleRender(); }, 400));
 
     this.pollStatus();
     if (this.radarOn) this.pollRadar();

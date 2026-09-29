@@ -95,6 +95,61 @@ function register({ test }) {
       'Ctrl-C must not kill the daemon');
   });
 
+  test('constructing a mock bot never pins the event loop', () => {
+    // Regression: the mock ran a 120ms physics tick on an interval that was
+    // never unref'd. Any script that built a MockBot — including a throwaway
+    // two-line probe in a REPL — then refused to exit. stdout is buffered until
+    // exit, so the symptom was a terminal that printed nothing and ignored
+    // input, indistinguishable from a hung machine.
+    //
+    // unref'd timers do not keep the process alive, which is what we want:
+    // a fake world must never outlive the thing inspecting it.
+    const { MockWorld, MockBot } = require(path.join(SRC, 'mock.js'));
+    const bot = new MockBot(new MockWorld());
+    bot._spawn();
+    assert.ok(Array.isArray(bot._timers) && bot._timers.length > 0,
+      'the mock must track the timers it creates so they can be unref\'d');
+    for (const t of bot._timers) {
+      assert.strictEqual(t.hasRef(), false,
+        'every mock timer must be unref\'d so the process can exit');
+    }
+  });
+
+  test('Ctrl-C during the initial daemon-connect wait still works', async () => {
+    // Regression: start() used to register the stdin handler AFTER awaiting
+    // connectOrSpawnDaemon(). With no daemon running that awaits for ~20s
+    // while it spawns and retries, and raw mode silently drops any keypress
+    // that has no listener — so launching the TUI cold trapped the user in a
+    // dashboard that ignored Ctrl-C, q and Escape.
+    const screen = new VirtualScreen(80, 24);
+    const { tui } = makeTui(screen);
+    let exited = false;
+    const origExit = process.exit;
+    process.exit = () => { exited = true; };
+
+    // a deliberately slow connect: resolve nothing for a while
+    let release;
+    const hang = new Promise(r => { release = r; });
+    tui.connectOrSpawnDaemon = () => hang;
+
+    try {
+      const starting = tui.start();
+      // the connect is still pending while we press the key — this is the
+      // window that used to swallow input
+      await new Promise(r => setImmediate(r));
+      await new Promise(r => setImmediate(r));
+      assert.strictEqual(tui.daemonState, 'connecting',
+        'the TUI should be visibly in its connecting state');
+      tui._quitForTest = true;
+      tui.onKey(Buffer.from('\x03', 'utf8'));
+      assert.ok(exited, 'Ctrl-C must exit even before the daemon connect finishes');
+    } finally {
+      process.exit = origExit;
+      release();
+      await starting.catch(() => {});
+    }
+  });
+
   test('the dedicated quit key DOES ask the daemon to shut down', () => {
     const screen = new VirtualScreen(80, 24);
     const { tui, ipc } = makeTui(screen);

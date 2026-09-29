@@ -173,6 +173,8 @@ class MockInventory {
     if (it) it.count += count;
     else this._items.push({ name, count, stackSize: 64 });
   }
+  /** Test helper: start from a known inventory. */
+  clear() { this._items = []; }
 }
 
 // 2x2 inventory recipes the mock knows: exactly the vanilla shape the task
@@ -283,9 +285,16 @@ class MockBot extends EventEmitter {
     this.players['Steve'] = { entity: null }; // offline until sim
 
     // spawn after a short delay, mimicking the real handshake
-    setTimeout(() => this._spawn(), 400);
+    // unref: a mock world's timers must never keep a process alive. Without
+    // this, any script that so much as constructs a MockBot hangs forever on
+    // exit, holding buffered stdout hostage — a 3-line REPL probe produces a
+    // terminal that looks dead while the tick interval spins in the dark.
+    const spawnTimer = setTimeout(() => this._spawn(), 400);
     // mob + physics tick
-    setInterval(() => this._tick(), 120);
+    const tickTimer = setInterval(() => this._tick(), 120);
+    spawnTimer.unref();
+    tickTimer.unref();
+    this._timers = [spawnTimer, tickTimer];
   }
 
   _spawn() {

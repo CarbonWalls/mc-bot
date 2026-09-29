@@ -105,18 +105,26 @@ function register({ test }) {
     const actor = new Actor(bot, {
       config: { mode: 'afk', survive: { enabled: false }, canDig: true }
     });
-    // give the bot 2 logs — exactly what one pickaxe needs
+    // give the bot 2 logs — exactly what one pickaxe needs.
+    // The mock starts with a default survival kit (8 logs, bread, diamond
+    // tools), so clear first: a crafting test must start from a known inventory
+    // or the arithmetic is whatever the kit happened to contribute.
+    bot.inventory.clear();
     bot.inventory.give('oak_log', 2);
     assert.strictEqual(typeof bot.recipesFor, 'function', 'recipesFor must live on the bot');
-    // planks
-    assert.ok(await actor.craftItem('oak_planks', 8), 'planks must craft from logs');
+    // Craft count = number of crafting operations, not items out: 1 log per
+    // craft, 4 planks per craft, so 2 crafts eat 2 logs and yield 8 planks.
+    assert.ok(await actor.craftItem('oak_planks', 2), 'planks must craft from logs');
+    assert.strictEqual(count(bot, 'oak_log'), 0, 'all logs must be consumed');
     assert.strictEqual(count(bot, 'oak_planks'), 8, '2 logs -> 8 planks');
-    // sticks (4 sticks from 2 planks)
-    await actor.craftItem('stick', 4);
-    assert.ok(count(bot, 'stick') >= 2, 'sticks must be crafted');
-    // the pickaxe itself
+    // 1 stick craft: 2 planks in, 4 sticks out
+    await actor.craftItem('stick', 1);
+    assert.strictEqual(count(bot, 'stick'), 4, 'sticks must be crafted');
+    assert.strictEqual(count(bot, 'oak_planks'), 6, 'the stick craft must cost 2 planks');
+    // the pickaxe itself: 3 planks + 2 sticks
     await actor.craftItem('wooden_pickaxe', 1);
     assert.strictEqual(count(bot, 'wooden_pickaxe'), 1, 'the pickaxe must be crafted');
+    assert.strictEqual(count(bot, 'oak_planks'), 3, 'the pickaxe must cost 3 planks');
   });
 
   test('crafting reports a reason when ingredients are missing', async () => {
@@ -124,6 +132,7 @@ function register({ test }) {
     const { Actor } = require(path.join(SRC, 'actor.js'));
     const bot = new MockBot(new MockWorld());
     bot._spawn();
+    bot.inventory.clear();
     const actor = new Actor(bot, { config: { mode: 'afk', survive: { enabled: false } } });
     await assert.rejects(() => actor.craftItem('wooden_pickaxe', 1), /no recipe|missing/,
       'a craft with no ingredients must reject with a reason');
