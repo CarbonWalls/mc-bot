@@ -198,8 +198,16 @@ class BotCore {
           if (moveToggle) {
             const p = bot.entity.position;
             const dx = p.x - Math.sin(yaw) * dist, dz = p.z + Math.cos(yaw) * dist;
-            this.logger.debug('anti-idle step out', { dx: dx.toFixed(1), dz: dz.toFixed(1) });
-            this.actor.setMode('goto', [String(Math.floor(dx)), String(Math.floor(p.y)), String(Math.floor(dz))]);
+            // Delegate the ground lookup to the actor, which owns topSolidY.
+            // Using the bot's raw y made the goal a point floating in mid-air
+            // whenever the bot stood above or below the target's level — an
+            // 8-block drop onto home left the pathfinder with no walkable
+            // route, it emitted path_stop, and the bot froze in place.
+            const t = this.actor.antiIdleTarget(Math.floor(dx), Math.floor(dz));
+            if (t) {
+              this.logger.debug('anti-idle step out', { dx: dx.toFixed(1), dz: dz.toFixed(1), y: t.y });
+              this.actor.setMode('goto', [String(t.x), String(t.y), String(t.z)]);
+            }
           } else {
             this.logger.debug('anti-idle step back home', {});
             this.actor.setMode('come');

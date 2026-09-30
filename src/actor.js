@@ -449,6 +449,19 @@ class Actor {
     this.goalDesc = null;
   }
 
+  /**
+   * Ground-level destination for an anti-idle shuffle step. Returns null when
+   * there is no solid footing at that column, so the caller skips the step
+   * instead of pathing into a wall or off a cliff.
+   */
+  antiIdleTarget(x, z) {
+    const bot = this.bot;
+    if (!bot || !bot.entity) return null;
+    const y = topSolidY(bot, x, z, Math.floor(bot.entity.position.y));
+    if (y == null) return null;
+    return { x, y, z };
+  }
+
   /* ------------------------------------------------------------------ *
    * modes
    * ------------------------------------------------------------------ */
