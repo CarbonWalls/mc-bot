@@ -111,6 +111,11 @@ class Actor {
     this.eating = false;
     this.prevMode = null;            // mode to restore after flee/fight
 
+    // PvP opponent controller. Created lazily on first use so the passive
+    // default never pays for it; it owns its own control loop and clears the
+    // control states when it stops.
+    this.pvp = null;
+
     this._wire();
   }
 
@@ -159,6 +164,10 @@ class Actor {
       on('goal_reached', (g) => {
         this.log.debug('actor: goal reached', { mode: this.mode });
         this.goalDesc = null;
+        // Anti-idle uses goto/come as a one-step shuffle and needs the goal
+        // cleared on arrival, otherwise the leftover goalDesc blocks every
+        // later anti-idle tick and the server eventually kicks for idling.
+        if (this.mode === 'goto' || this.mode === 'come') this.setMode('afk');
       });
       on('path_reset', (reason) => {
         this.log.debug('actor: path reset', { reason });
@@ -274,6 +283,9 @@ class Actor {
     const active = this.mode !== 'afk' && this.mode !== 'hold' && this.mode !== 'come';
     if (!(this.survive || active)) return;
     if (this.mode === 'fight' || this.mode === 'flee') return;
+    // PvP owns its own spacing and retreats on its own clock; the survival
+    // layer would otherwise fight it for the movement controls.
+    if (this.mode === 'pvp') return;
 
     // At night, melee mobs can close from spawning range to hitting range
     // faster than a 20-tick poll notices, so raise the bar for staying: if one
@@ -422,6 +434,7 @@ class Actor {
     if (!bot || !bot.entity) return { ok: false, msg: 'bot not spawned yet' };
 
     // stop whatever async loop is running
+    if (this.pvp && this.pvp.running && mode !== 'pvp') this.pvp.stop(`mode->${mode}`);
     this.mode = mode;                 // loops re-check this each step
     this.stuckAttempts = 0;
     this.prevMode = null;
@@ -483,6 +496,29 @@ class Actor {
         this.mode = 'fight';
         this.fightLoop().catch(e => this.log.debug('fight loop ended', { error: e.message }));
         return { ok: true, msg: `Attacking ${name}` };
+      }
+      case 'pvp': {
+        // pvp <player> [tier 0..1]  — tier names map to numbers
+        const name = args[0];
+        if (!name) return { ok: false, msg: 'usage: pvp <player> [rookie|medium|hard|0..1] [stop|hp <n>]' };
+        const sub = String(args[1] || '').toLowerCase();
+        if (sub === 'stop' || sub === 'off') {
+          return this.pvp && this.pvp.running ? this.pvp.stop('command') : { ok: false, msg: 'pvp not running' };
+        }
+        if (sub === 'hp') {
+          if (!this.pvp || !this.pvp.running) return { ok: false, msg: 'pvp not running' };
+          const n = parseFloat(args[2]);
+          if (!Number.isFinite(n)) return { ok: false, msg: 'usage: pvp <player> hp <n>' };
+          return this.pvp.setHealth(n);
+        }
+        const tier = TIERNAMES[sub] != null ? TIERNAMES[sub] : (parseFloat(sub) || 0.5);
+        const pl = bot.players && bot.players[name];
+        if (!pl || !pl.entity) return { ok: false, msg: `cannot see player ${name}` };
+        if (!this.pvp) this.pvp = new PvpController(bot, { logger: this.log, actor: this, config: this.cfg });
+        // take the bot out of any pathing goal so the two never fight
+        this._clearGoal();
+        this.mode = 'pvp';
+        return this.pvp.start(name, tier);
       }
       default:
         return { ok: false, msg: `mode ${mode} not implemented` };
@@ -1037,7 +1073,10 @@ class Actor {
     const args = parts.slice(1);
     switch (cmd) {
       case '': return { ok: false, msg: 'empty command' };
-      case 'afk': case 'stop': return this.setMode('afk');
+      case 'afk': case 'stop': {
+        if (this.pvp && this.pvp.running) this.pvp.stop('afk');
+        return this.setMode('afk');
+      }
       case 'hold': return this.setMode('hold');
       case 'goto': return this.setMode('goto', args);
       case 'come': return this.setMode('come');
@@ -1059,6 +1098,7 @@ class Actor {
         return { ok: true, msg: `Task queue: wood -> planks -> sticks -> ${n}x pickaxe` };
       }
       case 'attack': case 'kill': return this.setMode('attack', args);
+      case 'pvp': return this.setMode('pvp', args);
       case 'eat': {
         this.eat().catch(() => {});
         return { ok: true, msg: 'eating' };
@@ -1083,7 +1123,8 @@ class Actor {
           ok: true,
           msg: 'commands: afk | hold | goto <x> [y] <z> | come | home [x y z] | ' +
                'follow <player> [range] | wander [radius] | gather [radius] | ' +
-               'attack <name> | eat | survive on|off'
+               'attack <name> | pvp <player> [rookie|medium|hard|0..1] [stop|hp <n>] | ' +
+               'eat | survive on|off'
         };
       default:
         return { ok: false, msg: `unknown command: ${cmd} (try 'help')` };
@@ -1091,7 +1132,11 @@ class Actor {
   }
 }
 
-const VALID_MODES = new Set(['afk', 'hold', 'goto', 'come', 'follow', 'wander', 'gather', 'attack']);
+const { PvpController } = require('./pvp');
+
+const TIERNAMES = { rookie: 0, easy: 0.25, medium: 0.5, veteran: 0.75, hard: 1 };
+
+const VALID_MODES = new Set(['afk', 'hold', 'goto', 'come', 'follow', 'wander', 'gather', 'attack', 'pvp']);
 
 const NEIGHBOURS = [
   [1, 0, 0], [-1, 0, 0], [0, 1, 0], [0, -1, 0], [0, 0, 1], [0, 0, -1]

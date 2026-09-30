@@ -110,6 +110,11 @@ function loadConfig(argv = process.argv.slice(2)) {
     cfg.behaviors = cfg.behaviors || {};
     cfg.behaviors.mode = args.mode;
   }
+  // --anti-idle-movement on|off — some servers kick on position, not view angle
+  if (args['anti-idle-movement']) {
+    cfg.antiIdle = cfg.antiIdle || {};
+    cfg.antiIdle.movement = ['on', 'true', '1', 'yes'].includes(String(args['anti-idle-movement']).toLowerCase());
+  }
   // --home x y z
   const homeIdx = argv.indexOf('--home');
   if (homeIdx !== -1 && argv[homeIdx + 3] !== undefined) {

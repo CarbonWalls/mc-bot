@@ -169,12 +169,45 @@ class BotCore {
     const cfg = this.cfg;
     if (!cfg.antiIdle.enabled) return;
     if (this.spawnYaw === null && this.bot) this.spawnYaw = this.bot.entity ? this.bot.entity.yaw : 0;
+    let moveToggle = false;
     this.antiIdleTimer = setInterval(() => {
       const bot = this.bot;
       if (!bot || !bot.entity) return;
-      // never fight the actor: anti-idle only nudges when nothing is pathing
-      if (this.actor && this.actor.goalDesc) return;
+      // PvP owns the movement controls; stepping away mid-fight would hand
+      // the opponent free hits.
+      if (this.actor && this.actor.mode === 'pvp') return;
       try {
+        // Some servers (this one included) kick for "idling" based on
+        // *position*, not view angle — a yaw nudge never reaches their
+        // threshold and the bot gets dropped after ~35 min of perfect
+        // stillness. When movement is enabled, take one small real step
+        // every other cycle: walk briefly in a random direction, then walk
+        // back on the next tick so the bot stays on its spot. Real packets,
+        // net-zero drift.
+        //
+        // This branch is checked *before* the goalDesc guard on purpose: the
+        // step itself creates a goal, so a guard here would see the goal it
+        // just set and never fire again — the bot would take one step and
+        // then be stuck motionless until the server kicked it. The goto/come
+        // goals clear themselves on arrival (goal_reached), so each cycle
+        // starts from a clean slate.
+        if (cfg.antiIdle.movement && bot.pathfinder && this.actor && !this.actor.busy) {
+          moveToggle = !moveToggle;
+          const yaw = (this.spawnYaw || 0) + (Math.random() * 2 - 1) * Math.PI;
+          const dist = 1.5 + Math.random() * 1.5;
+          if (moveToggle) {
+            const p = bot.entity.position;
+            const dx = p.x - Math.sin(yaw) * dist, dz = p.z + Math.cos(yaw) * dist;
+            this.logger.debug('anti-idle step out', { dx: dx.toFixed(1), dz: dz.toFixed(1) });
+            this.actor.setMode('goto', [String(Math.floor(dx)), String(Math.floor(p.y)), String(Math.floor(dz))]);
+          } else {
+            this.logger.debug('anti-idle step back home', {});
+            this.actor.setMode('come');
+          }
+          return;
+        }
+        // never fight the actor: look-only anti-idle yields to a live goal
+        if (this.actor && this.actor.goalDesc) return;
         const delta = (Math.random() * 2 - 1) * (cfg.antiIdle.maxYawDeltaDeg * Math.PI / 180);
         const yaw = (this.spawnYaw || 0) + delta;
         const pitch = bot.entity.pitch || 0;
