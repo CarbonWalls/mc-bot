@@ -36,6 +36,44 @@ const LOG_BLOCKS = new Set([
   'mangrove_log', 'cherry_log', 'bamboo', 'crimson_stem', 'warped_stem'
 ]);
 
+/**
+ * GoalFollow wrapper that tolerates a target that de-spawns or leaves the
+ * bot's entity-tracking range.
+ *
+ * mineflayer-pathfinder's own GoalFollow dereferences the entity it was given
+ * on every pathing tick (`entity.position` in isValid/hasChanged). If the
+ * target's entity goes null while a path is live — which happens whenever a
+ * player walks far enough away that the server stops sending their entity —
+ * the pathfinder throws inside its own timer. That exception is unhandled, so
+ * it killed the whole bot process mid-heartbeat, with no stack trace in the
+ * log and no error event, just a silent exit. This is what took the bot down
+ * when it was asked to follow a player who was already 60+ blocks off.
+ *
+ * Instead of handing it a raw entity, we hand it a fresh one each tick and
+ * report "unreachable" when the target is gone, which the existing path_stop
+ * handling turns into a clean fallback to AFK.
+ */
+class SafeGoalFollow extends GoalFollow {
+  constructor(resolve, range, reach) {
+    super({ position: new Vec3(0, 0, 0) }, range, reach);
+    this._resolve = resolve;
+  }
+
+  isValid(x, y, z) {
+    const e = this._resolve();
+    if (!e || !e.position) return false;
+    this.entity = e;
+    return super.isValid(x, y, z);
+  }
+
+  hasChanged(x, y, z) {
+    const e = this._resolve();
+    if (!e || !e.position) return false;
+    this.entity = e;
+    return super.hasChanged(x, y, z);
+  }
+}
+
 const LEAF_BLOCKS = new Set([
   'oak_leaves', 'birch_leaves', 'spruce_leaves', 'jungle_leaves', 'acacia_leaves',
   'dark_oak_leaves', 'mangrove_leaves', 'cherry_leaves', 'azalea_leaves'
@@ -375,9 +413,12 @@ class Actor {
       case 'block': return new GoalBlock(desc.x, desc.y, desc.z);
       case 'xz': return new GoalXZ(desc.x, desc.z);
       case 'follow': {
-        const e = desc.resolve();
-        if (!e) return null;
-        return new GoalFollow(e, desc.range, desc.reach);
+        // SafeGoalFollow re-resolves the target each pathing tick and returns
+        // "unreachable" instead of throwing when it has de-spawned.
+        if (!desc.resolve) return null;
+        const e0 = desc.resolve();
+        if (!e0 || !e0.position) return null;
+        return new SafeGoalFollow(desc.resolve, desc.range, desc.reach);
       }
       case 'getto': return new GoalGetToBlock(desc.resolve());
       case 'invert': return new GoalInvert(this._buildGoal(desc.inner));
