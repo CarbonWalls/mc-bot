@@ -102,6 +102,99 @@ contract.bot = {
   has: [...botProps].sort()
 };
 
+// --- the events this project's behaviour code subscribes to ------------------
+// Perception (src/perceive.js) listens for entity damage signals, and PvP
+// depends on them entirely: if mineflayer renames `entityHurt` or stops passing
+// the attacker, the bot silently loses every real health signal and reverts to
+// arithmetic — which is the exact bug the user reported ("it runs away even when
+// it thinks it won"). Recording which event names the INSTALLED packages
+// actually emit turns that from a silent regression into a test failure.
+const entSrc = read('node_modules/mineflayer/lib/plugins/entities.js') || '';
+const healthSrc = read('node_modules/mineflayer/lib/plugins/health.js') || '';
+const emitted = uniqSorted([
+  ...[...entSrc.matchAll(/bot\.emit\('([\w]+)'/g)].map(m => m[1]),
+  ...[...healthSrc.matchAll(/bot\.emit\('([\w]+)'/g)].map(m => m[1])
+]);
+// animation / status ids that mineflayer maps onto event names, read from the
+// installed source rather than from memory of the protocol
+const animMap = (entSrc.match(/const animationEvents = \{([\s\S]*?)\n\}/) || [])[1] || '';
+const statusMap = (entSrc.match(/const entityStatusEvents = \{([\s\S]*?)\n\}/) || [])[1] || '';
+const mapNames = (body) => uniqSorted([...body.matchAll(/:\s*'([\w]+)'/g)].map(m => m[1]));
+// Events reached through the id->name maps are emitted as bot.emit(eventName, ...)
+// with a VARIABLE, so a regex on literal names misses them. Union all three
+// sources; otherwise the contract claims mineflayer never emits entitySwingArm,
+// which is false and would fail the test that guards perception.
+const allEvents = uniqSorted([...emitted, ...mapNames(animMap), ...mapNames(statusMap)]);
+contract.events = {
+  _source: 'mineflayer/lib/plugins/entities.js + health.js — bot.emit(...) plus the animation/status id maps',
+  emitted: allEvents,
+  literalEmits: emitted,
+  animationEvents: mapNames(animMap),
+  statusEvents: mapNames(statusMap),
+  // The ones src/perceive.js relies on. If any disappears, perception degrades
+  // to estimates and the PvP outcomes become guesses again.
+  required: [
+    'health', 'death', 'respawn', 'entityHurt', 'entitySwingArm', 'entityDead',
+    'entityGone', 'entitySpawn', 'entityUpdate', 'itemDrop',
+    'playerJoined', 'playerLeft', 'playerUpdated'
+  ],
+  requiredLowLevel: ['animation'],
+  damageEventHasSource: /damage_event[\s\S]{0,400}sourceCauseId/.test(entSrc)
+    ? 'entities.js passes (entity, source) to entityHurt on 1.20+, so "I hurt them" is confirmable'
+    : 'no damage_event source: confirmed hits can only be inferred from animation'
+};
+
+// --- player gamemode: the field that answers "is this opponent even damageable" --
+contract.playerInfo = {
+  _source: 'mineflayer/lib/plugins/entities.js player_info handlers',
+  playerField: /player\.gamemode\s*=\s*item\.gamemode/.test(entSrc) ? 'gamemode (number 0..3)' : 'MISSING — gamemode is not read from player_info in this build',
+  tabListUpdated: /update_game_mode/.test(entSrc) ? 'update_game_mode handled' : 'update_game_mode NOT handled',
+  botGameMode: 'bot.game.gameMode is a NAME string ("survival"|"creative"|...) via parseGameMode'
+};
+
+// --- movement controls: what the terrain-aware controller assumes ------------
+const physSrc = read('node_modules/mineflayer/lib/plugins/physics.js') || '';
+contract.controls = {
+  _source: 'mineflayer/lib/plugins/physics.js',
+  setControlState: /bot\.setControlState\s*=/.test(physSrc),
+  getControlState: /bot\.getControlState\s*=/.test(physSrc),
+  clearControlStates: /bot\.clearControlStates\s*=/.test(physSrc),
+  names: uniqSorted([...physSrc.matchAll(/^\s{4}(forward|back|left|right|jump|sprint|sneak):/gm)].map(m => m[1])),
+  assertsOnBadName: /assert\.ok\(control in controlState/.test(physSrc),
+  _note: 'setControlState throws on an unknown control name, so every call site must be inside movement.set() (try/catch) or use a verified name.'
+};
+
+// --- pathfinder jump planning: the hard 1.2 limit behind "won't climb" --------
+const mvSrc = read('node_modules/mineflayer-pathfinder/lib/movements.js') || '';
+contract.movements = {
+  _source: 'mineflayer-pathfinder/lib/movements.js',
+  // `if (blockC.height - block0.height > 1.2) return` — the guard needs the
+  // closing paren matched, otherwise this records null and the contract silently
+  // loses the number that justifies climbOut existing at all.
+  // The guard reads `if (blockC.height - block0.height > 1.2) return`, so the
+  // closing paren sits between the number and the keyword; omitting it from the
+  // pattern makes this record null, which quietly deletes the justification for
+  // climbOut from the contract.
+  jumpHeightHardLimit: [...mvSrc.matchAll(/height - \w+\.height > ([\d.]+)\s*\)\s*return/g)].map(m => Number(m[1])).sort((a, b) => a - b)[0] || null,
+  maxDropDownDefault: (mvSrc.match(/this\.maxDropDown = ([\d.]+)/) || [])[1] || null,
+  allow1by1towers: /this\.allow1by1towers = true/.test(mvSrc),
+  knobs: uniqSorted([...mvSrc.matchAll(/this\.(canDig|digCost|placeCost|liquidCost|allowSprinting|allowParkour|allowFreeMotion|maxDropDown|allow1by1towers) =/g)].map(m => m[1])),
+  _note: 'There is NO maxJumpHeight knob: a climb taller than the hard limit cannot be PLANNED, only executed. That asymmetry (fall up to maxDropDown, climb ~1) is why hole escape is handled by src/movement.js climbOut and not by the pathfinder.'
+};
+
+// --- prismarine-physics: the authority on the yaw convention -----------------
+const ppSrc = read('node_modules/prismarine-physics/index.js') || '';
+const applyHeading = (ppSrc.match(/function applyHeading[\s\S]*?\n  \}/) || [])[0] || '';
+contract.physics = {
+  _source: 'prismarine-physics/index.js applyHeading + mineflayer lookAt',
+  forwardFromYaw: '(-sin yaw, -cos yaw)',
+  rightFromYaw: '(cos yaw, -sin yaw)',
+  strafeFormula: /vel\.x -= strafe \* cos \+ forward \* sin/.test(applyHeading) ? 'verified in installed source' : 'CHANGED — re-derive the vectors before trusting movement.js',
+  lookAtFormula: /Math\.atan2\(-delta\.x, -delta\.z\)/.test(physSrc) ? 'yaw = atan2(-dx, -dz), matches forwardFromYaw' : 'CHANGED',
+  gravityIsScalar: /gravity: [\d.]+/.test(ppSrc),
+  _note: 'src/movement.js basis() must keep matching these. A sign flip here is invisible except as a bot that strafes into walls.'
+};
+
 // Export for the test suite (require); print when run as a script.
 module.exports = contract;
 if (require.main === module) {

@@ -1,8 +1,8 @@
 {
-  "host": "4of5.aternos.me",
-  "port": 44640,
-  "bedrockHost": "4of5.aternos.me",
-  "bedrockPort": 44640,
+  "host": "betahhd.aternos.me",
+  "port": 49851,
+  "bedrockHost": "betahhd.aternos.me",
+  "bedrockPort": 49851,
   "username": "AFK_Bot",
   "version": "auto",
   "auth": "offline",
@@ -13,7 +13,9 @@
     "initialDelayMs": 5000,
     "maxDelayMs": 120000,
     "multiplier": 1.75,
-    "jitterMs": 2000
+    "jitterMs": 2000,
+    "maxAttempts": 25,
+    "exitOnGiveUp": true
   },
   "antiIdle": {
     "enabled": true,
@@ -21,10 +23,50 @@
     "maxYawDeltaDeg": 12,
     "movement": false
   },
+  "behaviors": {
+    "mode": "afk",
+    "survive": {
+      "enabled": false,
+      "eatAt": 16,
+      "fleeHealth": 10,
+      "nightFleeRadius": 12,
+      "attack": true,
+      "autoRespawn": true
+    },
+    "canDig": true,
+    "allowSprinting": true,
+    "stuckTimeoutMs": 6000,
+    "maxStuckAttempts": 4,
+    "movements": {
+      "maxDropDown": 2
+    },
+    "pvp": {
+      "reach": 3,
+      "retreatHp": 6,
+      "safeHp": 12,
+      "maxDrop": 1,
+      "descendMax": 3,
+      "verifyMs": 4000,
+      "autoEat": true
+    },
+    "ai": {
+      "pvp": "off",
+      "ttlMs": 1200
+    }
+  },
   "logging": {
     "level": "info",
     "file": "logs/bot.log",
     "jsonl": "logs/bot.jsonl",
     "statusFile": "logs/status.json"
+  },
+  "_verifiedTarget": {
+    "host": "betahhd.aternos.me",
+    "port": 49851,
+    "protocol": 774,
+    "versionName": "Paper 1.21.11",
+    "how": "mc targets (probeServer + minecraft-data data dir)",
+    "note": "re-verify with `mc targets`; Aternos rotates names and owners upgrade Paper",
+    "verifiedAt": "2026-10-02T22:46:13.938Z"
   }
 }

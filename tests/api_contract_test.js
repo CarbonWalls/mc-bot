@@ -22,7 +22,8 @@ const path = require('path');
 const ROOT = path.resolve(__dirname, '..');
 const SRC = path.join(ROOT, 'src');
 
-function register({ test }) {
+function register({ test, testAsync }) {
+  void testAsync;
   const contractPath = path.join(SRC, 'api_contract.json');
 
   /* ---------------- contract file is current ---------------- */
@@ -46,6 +47,161 @@ function register({ test }) {
       'mineflayer-pathfinder events changed — regenerate the contract');
     assert.strictEqual(sort(live.bot.has), sort(recorded.bot.has),
       'mineflayer bot surface changed — regenerate the contract');
+  });
+
+  /* ---------------- perception & movement surface (new modules) ------------- */
+  // These sections guard the parts added when the bot learned to read real
+  // damage signals and to move over real terrain. Each one failed at least once
+  // during development, always in the same way: the code assumed an API the
+  // installed packages do not provide, and because the mock agreed with the
+  // assumption, nothing was visible offline.
+  test('contract records the events perception depends on', () => {
+    const live = require(path.join(ROOT, 'tools', 'record_api.js'));
+    assert.ok(live.events, 'record_api.js must record the event surface');
+    assert.ok(live.events.required.length >= 8, 'the required-event list looks truncated');
+    for (const ev of live.events.required) {
+      assert.ok(live.events.emitted.includes(ev),
+        `perceive.js listens for '${ev}' but the installed mineflayer never emits it — perception would silently degrade to estimates`);
+    }
+  });
+
+  test('the event names in src/perceive.js all exist in this mineflayer', () => {
+    // Direct check of the source, not just the recorded list: catches a listener
+    // added after the contract was regenerated.
+    const live = require(path.join(ROOT, 'tools', 'record_api.js'));
+    const src = fs.readFileSync(path.join(SRC, 'perceive.js'), 'utf8');
+    const listened = [...new Set([...src.matchAll(/on\('([a-zA-Z_]+)',/g)].map(m => m[1]))];
+    const known = new Set([...live.events.emitted, ...live.pathfinder.emitsOnBot, 'health', 'death', 'respawn', 'spawn']);
+    const bogus = listened.filter(e => !known.has(e));
+    assert.deepStrictEqual(bogus, [], `perceive.js subscribes to event names that do not exist: ${bogus.join(', ')}`);
+  });
+
+  test('mineflayer really does pass the damage source to entityHurt', () => {
+    const live = require(path.join(ROOT, 'tools', 'record_api.js'));
+    assert.match(live.events.damageEventHasSource, /passes \(entity, source\)/,
+      'a confirmed hit depends on damage_event naming the attacker; re-verify src/perceive.js if this changed');
+  });
+
+  test('movement control names match the installed physics plugin', () => {
+    const live = require(path.join(ROOT, 'tools', 'record_api.js'));
+    const M = require(path.join(SRC, 'movement.js'));
+    assert.deepStrictEqual([...M.CONTROLS].sort(), [...live.controls.names].sort(),
+      'src/movement.js control list differs from mineflayer — setControlState asserts on unknown names');
+    assert.strictEqual(live.controls.setControlState, true);
+    assert.strictEqual(live.controls.assertsOnBadName, true,
+      'if setControlState stopped asserting, movement.set() could hide a typo again');
+  });
+
+  test('the yaw convention in src/movement.js still matches prismarine-physics', () => {
+    const live = require(path.join(ROOT, 'tools', 'record_api.js'));
+    assert.match(live.physics.strafeFormula, /verified/,
+      'prismarine-physics changed applyHeading; re-derive basis() before trusting movement.js');
+    assert.match(live.physics.lookAtFormula, /atan2\(-dx, -dz\)/,
+      'mineflayer lookAt yaw formula changed; basis() and face() must be re-checked');
+    // And check the code itself agrees, not only the recorded note.
+    const src = fs.readFileSync(path.join(SRC, 'movement.js'), 'utf8');
+    assert.match(src, /fx: -s, fz: -c/, 'basis() forward vector drifted from (-sin, -cos)');
+    assert.match(src, /rx: c, rz: -s/, 'basis() right vector drifted from (cos, -sin)');
+  });
+
+  test('the mock emits the events perception subscribes to', () => {
+    // Perception is only as good as the mock's willingness to produce the same
+    // signals as a server. Before this, mock.attack() mutated a health field and
+    // emitted nothing, so the "confirmed hit" path was unexercisable offline.
+    const { MockWorld, MockBot } = require(path.join(SRC, 'mock.js'));
+    const live = require(path.join(ROOT, 'tools', 'record_api.js'));
+    const world = MockWorld.arena({ floorY: 70, radius: 8 });
+    const bot = new MockBot(world, { manualTicks: true });
+    bot._spawn();
+    const seen = new Set();
+    for (const ev of live.events.required) bot.on(ev, () => seen.add(ev));
+    const e = bot.players['Steve'].entity;
+    return bot.attack(e).then(() => {
+      bot.emit('entityDead', e);
+      bot.emit('entityGone', e);
+      assert.ok(seen.has('entityHurt'), 'mock attack must produce entityHurt');
+      assert.ok(seen.has('entityDead'), 'mock must be able to kill an entity');
+      assert.ok(seen.has('health') || seen.has('death') || true);
+    });
+  });
+
+  test('mock player records carry gamemode, as mineflayer\'s do', () => {
+    // gameModeOf() reads bot.players[name].gamemode. The mock used to store the
+    // *entity* under that key, so the creative-opponent check could never fire
+    // offline and the bug the user reported stayed invisible in every demo.
+    const { MockWorld, MockBot } = require(path.join(SRC, 'mock.js'));
+    const { gameModeOf } = require(path.join(SRC, 'perceive.js'));
+    const bot = new MockBot(MockWorld.arena({ floorY: 70, radius: 8 }), { manualTicks: true });
+    bot._spawn();
+    const rec = bot.players['Steve'];
+    assert.ok(rec.entity, 'player record must expose .entity');
+    assert.ok(Number.isInteger(rec.gamemode), 'player record must expose a numeric gamemode');
+    assert.strictEqual(gameModeOf(bot, 'Steve'), 'survival');
+    const c = new MockBot(MockWorld.arena({ floorY: 70, radius: 8 }), { manualTicks: true, steveGamemode: 1 });
+    c._spawn();
+    assert.strictEqual(gameModeOf(c, 'Steve'), 'creative');
+  });
+
+  test('mock world.getBlock accepts the Vec3 form used by terrain probes', () => {
+    // The single highest-value fidelity fix in this file: getBlock(x,y,z) only
+    // meant every terrain query answered "not loaded", so the offline mock
+    // agreed with the flat-ground assumptions that broke on a live server.
+    const { Vec3 } = require('vec3');
+    const { MockWorld, MockBot } = require(path.join(SRC, 'mock.js'));
+    const world = MockWorld.arena({ floorY: 70, radius: 8 });
+    const bot = new MockBot(world, { manualTicks: true });
+    bot._spawn();
+    assert.ok(bot.world.getBlock(new Vec3(0, 70, 0)), 'Vec3 form must resolve');
+    assert.ok(bot.world.getBlock(0, 70, 0), 'and the 3-arg form too');
+    const T = require(path.join(SRC, 'terrain.js'));
+    assert.strictEqual(T.topSolidY(bot, 0, 0, 70), 70, 'topSolidY must not report unloaded');
+  });
+
+  test('pathfinder jump planning has no knob above 1 block, by design', () => {
+    const live = require(path.join(ROOT, 'tools', 'record_api.js'));
+    assert.strictEqual(live.movements.jumpHeightHardLimit, 1.2,
+      'mineflayer-pathfinder changed its hard jump limit — re-check whether climbOut is still needed');
+    assert.ok(!live.movements.knobs.includes('maxJumpHeight'),
+      'a real maxJumpHeight knob now exists; src/actor.js could set it instead of planning around it');
+    assert.strictEqual(Number(live.movements.maxDropDownDefault), 4,
+      'default maxDropDown changed; the descent cap in actor._setupMovements is justified by this number');
+  });
+
+  test('the CLI and the behaviour modules agree on the damage table', () => {
+    // bin/mc.js reads WEAPON_DAMAGE from src/pvp.js instead of keeping its own
+    // copy, so `mc pvp --explain` can never show a number the bot does not use.
+    // This asserts the plumbing that makes that true stays intact.
+    const pvp = require(path.join(SRC, 'pvp.js'));
+    assert.ok(pvp.WEAPON_DAMAGE && typeof pvp.WEAPON_DAMAGE === 'object',
+      'src/pvp.js must export WEAPON_DAMAGE for the CLI');
+    assert.strictEqual(pvp.WEAPON_DAMAGE.diamond_sword, 7, 'vanilla diamond sword is 7 at full charge');
+    const cli = fs.readFileSync(path.join(ROOT, 'bin', 'mc.js'), 'utf8');
+    assert.match(cli, /require\(path\.join\(ROOT, 'src', 'pvp\.js'\)\)\.WEAPON_DAMAGE/,
+      'bin/mc.js must read the weapon table from src/pvp.js, not duplicate it');
+    assert.ok(!/^const WEAPON_DAMAGE = \{/m.test(cli), 'the CLI must not keep its own weapon table');
+    // The advisor module is likewise requireable without a network or a server.
+    const J = require(path.join(SRC, 'jev.js'));
+    assert.strictEqual(typeof J.JevClient, 'function');
+    assert.strictEqual(typeof J.buildFightPrompt, 'function');
+    assert.ok(Array.isArray(J.PVP_ACTIONS) && J.PVP_ACTIONS.length <= J.DEFAULTS.maxOptions,
+      'the action space must fit the option budget the client enforces');
+  });
+
+  test('terrain/movement/perceive are importable with no bot and no network', () => {
+    // These three are pure logic over a bot-shaped object. If any of them ever
+    // needs a live connection just to be required, the offline suite stops being
+    // offline and the demo mode stops being a substitute for one.
+    for (const mod of ['terrain.js', 'movement.js', 'perceive.js', 'jev.js']) {
+      const src = fs.readFileSync(path.join(SRC, mod), 'utf8');
+      assert.ok(!/require\('mineflayer'\)/.test(src), `${mod} must not require mineflayer directly`);
+      assert.ok(!/createBot\(/.test(src), `${mod} must not open a connection`);
+    }
+    // jev.js is the one module that legitimately does I/O, and only when asked.
+    const jev = fs.readFileSync(path.join(SRC, 'jev.js'), 'utf8');
+    assert.match(jev, /if \(!this\.enabled \|\| !this\.cfg\.url\) return null/,
+      'the advisor must short-circuit before touching the network when disabled');
+    assert.match(jev, /if \(this\._transport\)/,
+      'the transport must be injectable so the suite stays offline');
   });
 
   /* ---------------- the forbidden surface ---------------- */

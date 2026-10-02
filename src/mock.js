@@ -50,7 +50,24 @@ class MockWorld {
 
   has(x, y, z) { return this.blocks.has(this.key(x, y, z)); }
 
-  getBlock(x, y, z) {
+  /**
+   * Accepts BOTH call shapes the real API allows:
+   *   getBlock(new Vec3(x,y,z))   -- world accessor, what mineflayer-pathfinder
+   *                                  and anything doing `world.getBlock(pos)` uses
+   *   getBlock(x, y, z)           -- convenience form used inside this file
+   *
+   * This matters more than it looks. `world.getBlock(probe(x, 0, z))` was the
+   * only way terrain code checks whether a column is loaded, and the Vec3 form
+   * was silently treated as an out-of-world coordinate: every offline terrain
+   * query answered "not loaded", so topSolidY returned null, standable spots
+   * were never found, and the mock hid the exact flat-ground assumptions that
+   * broke on a live server. A mock that lies about the world is worse than no
+   * mock.
+   */
+  getBlock(a, b, c) {
+    let x, y, z;
+    if (a && typeof a === 'object' && a.x != null) { x = a.x; y = a.y; z = a.z; }
+    else { x = a; y = b; z = c; }
     if (x < -HALF || x > HALF || z < -HALF || z > HALF || y < WORLD_MIN_Y || y > WORLD_MAX_Y) return null;
     const name = this.blocks.get(this.key(Math.floor(x), Math.floor(y), Math.floor(z)));
     if (!name) return null;
@@ -148,6 +165,51 @@ class MockWorld {
     this.set(47, 68, 40, 'glass'); this.set(47, 69, 40, 'glass');
   }
 
+  /**
+   * A deterministic test arena, built from a height map.
+   *
+   * Generated worlds have rolling hills, which is realistic but useless for
+   * asserting "the bot climbed the step" — a hill can absorb a test by luck, and
+   * that is how a terrain bug stays invisible. Here each column's surface height
+   * is a function of (x,z), so features are exactly where the test says.
+   *
+   * opts: { floorY, radius, stepAtZ, wallAtZ, cliffBeyondZ, cliffDrop,
+   *         pit:[x,z,w,d], slope:n, slopeZ, waterAt:[x,z,w] }
+   */
+  static arena(opts = {}) {
+    const world = new MockWorld();
+    const G = opts.floorY != null ? opts.floorY : 70;
+    const R = opts.radius != null ? opts.radius : 24;
+    const height = (x, z) => {
+      let h = G;
+      if (opts.stepAtZ != null && z >= opts.stepAtZ) h += 1;
+      if (opts.wallAtZ != null && z >= opts.wallAtZ) h += 2;
+      if (opts.cliffBeyondZ != null && z > opts.cliffBeyondZ) h -= (opts.cliffDrop != null ? opts.cliffDrop : 4);
+      if (opts.pit) {
+        const [px, pz, pw, pd] = opts.pit;
+        if (x >= px && x < px + pw && z >= pz && z < pz + pw) h -= pd;
+      }
+      if (opts.slope && opts.slopeZ != null && z >= opts.slopeZ) h += Math.min(opts.slope, z - opts.slopeZ + 1);
+      return h;
+    };
+    for (let x = -R; x <= R; x++) {
+      for (let z = -R; z <= R; z++) {
+        const h = height(x, z);
+        for (let y = 0; y <= 127; y++) world.remove(x, y, z);
+        for (let y = 0; y <= Math.max(0, h); y++) world.set(x, y, z, y === h ? 'grass_block' : 'stone');
+        if (opts.waterAt) {
+          const [wx, wz, ww] = opts.waterAt;
+          if (x >= wx && x < wx + ww && z >= wz && z < wz + ww) {
+            for (let y = h + 1; y <= h + 3; y++) world.set(x, y, z, 'water');
+          }
+        }
+      }
+    }
+    world.arenaFloorY = G;
+    world.arenaHeight = height;
+    return world;
+  }
+
   tree(x, y, z, kind) {
     const log = kind === 'birch' ? 'birch_log' : 'oak_log';
     const leaf = kind === 'birch' ? 'birch_leaves' : 'oak_leaves';
@@ -195,8 +257,13 @@ class MockBot extends EventEmitter {
   constructor(world, opts = {}) {
     super();
     this._isMock = true;
-    this.world = world;
+    // Several call sites construct a MockBot with no world just to probe the API
+    // surface. That used to crash on the deferred spawn timer, *after* the tests
+    // had already printed their results — an ugly exit code and a stack trace
+    // that looks like a real failure. Give them a real world instead.
+    this.world = world || new MockWorld();
     this.username = opts.username || 'AFK_Bot';
+    this._opts = opts;
     this.game = { dimension: 'minecraft:overworld', height: WORLD_MAX_Y + 1, gameMode: 'survival' };
     this.health = 20;
     this.food = 20;
@@ -219,6 +286,14 @@ class MockBot extends EventEmitter {
     this.entities = {};
     this._digTime = 0;
     this._spawned = false;
+    // real physics plugin state the movement module reads
+    this._controls = { forward: false, back: false, left: false, right: false, jump: false, sprint: false, sneak: false };
+    this.controlState = new Proxy(this._controls, {});
+    this.controlChanges = 0;
+    this.jumpQueued = false;
+    this.time = { timeOfDay: 6000 };
+    this.heldItem = { name: 'diamond_sword' };
+    this.game.gameMode = 'survival';
 
     // --- fake pathfinder: mirrors the REAL mineflayer-pathfinder surface.
     // The real plugin stores state in closure variables and exposes only
@@ -289,6 +364,10 @@ class MockBot extends EventEmitter {
     // this, any script that so much as constructs a MockBot hangs forever on
     // exit, holding buffered stdout hostage — a 3-line REPL probe produces a
     // terminal that looks dead while the tick interval spins in the dark.
+    // opts.manualTicks: tests that drive `_tick()` by hand get their own clock.
+    // Without this, a test that also calls _tick() advances time twice as fast as
+    // it thinks it does, and asserts about behaviour that only half happened.
+    if (opts.manualTicks) { this._timers = []; return; }
     const spawnTimer = setTimeout(() => this._spawn(), 400);
     // mob + physics tick
     const tickTimer = setInterval(() => this._tick(), 120);
@@ -302,7 +381,27 @@ class MockBot extends EventEmitter {
     this._spawned = true;
     const y = this.world.surfaceY(0, 0);
     this.entity.position.set(0.5, y + 1, 0.5);
-    this.players['Steve'] = { entity: { position: new Vec3(6, y + 1, -4), username: 'Steve' } };
+    // Real mineflayer entities always carry a numeric id; a mock player without
+    // one silently disabled the whole perception layer (tracker.of() returned
+    // null), so the fake entities must match on that field too.
+    this._nextId = 3000;
+    const steve = {
+      id: this._nextId++, username: 'Steve', name: 'Steve', displayName: 'Steve',
+      type: 'player', kind: 'player', isValid: true, health: undefined,
+      position: new Vec3(6, y + 1, -4), velocity: new Vec3(0, 0, 0), equipment: []
+    };
+    this.entities[steve.id] = steve;
+    // mineflayer's bot.players[name] is a *player record* (uuid, username,
+    // gamemode, ping, entity), not the entity itself. Matching that shape matters:
+    // perception reads player.gamemode to decide whether an opponent can be hurt
+    // at all, and a mock that stores the entity directly made that lookup always
+    // return undefined, so the creative-opponent fix could not be exercised offline.
+    const steveRecord = {
+      username: 'Steve', uuid: '00000000-0000-0000-0000-00000000steve',
+      gamemode: this._opts.steveGamemode != null ? this._opts.steveGamemode : 0,
+      ping: 30, displayName: 'Steve', entity: steve
+    };
+    this.players['Steve'] = steveRecord;
     this.emit('spawn');
   }
 
@@ -310,6 +409,7 @@ class MockBot extends EventEmitter {
     if (!this._spawned) return;
     const now = Date.now();
     const e = this.entity;
+    const dt = 0.12;
 
     // walk toward the current goal
     const goal = this.pathfinder._goal;
@@ -317,7 +417,6 @@ class MockBot extends EventEmitter {
       const t = goalTarget(goal);
       if (t) {
         const speed = 4.6;                                   // blocks per second
-        const dt = 0.12;
         const dx = t.x - e.position.x, dz = t.z - e.position.z;
         const dist = Math.hypot(dx, dz);
         const range = goal.range || 1;
@@ -327,21 +426,49 @@ class MockBot extends EventEmitter {
           this.emit('goal_reached', goal);
           e.velocity.set(0, 0, 0);
         } else {
-          this.pathfinder._moving = true;                    // actually walking now
-          const step = Math.min(dist, speed * dt);
-          e.velocity.set(dx / dist * speed, 0, dz / dist * speed);
-          e.position.x += dx / dist * step;
-          e.position.z += dz / dist * step;
-          e.yaw = Math.atan2(-dx, dz);
+          // A pathfinder goal moves the bot by *issuing control states*, exactly
+          // as the real plugin does (forward, plus jump when the route needs it).
+          // The previous mock wrote positions directly, so a bot that could not
+          // jump still reached any target offline. Now the route is followed only
+          // if the terrain allows it: a step in the way stops the bot unless the
+          // goal driver also jumped, which is precisely the bug we are testing.
+          this.pathfinder._moving = true;
+          e.yaw = Math.atan2(-dx, -dz);          // mineflayer's own lookAt formula
+          // Surface-to-surface again: our feet are one above our own surface, so
+          // `stepUp > feetY` reports a genuine one-block step as "no jump needed"
+          // and the pathfinder-driven branch walks into it. Same off-by-one as the
+          // manual physics path, caught by `mc demo` crossing a step.
+          const ownSurface = this._surfaceAt(Math.floor(e.position.x), Math.floor(e.position.z));
+          const stepUp = this._surfaceAt(Math.floor(e.position.x + dx / dist), Math.floor(e.position.z + dz / dist));
+          const jumpNeeded = stepUp != null && ownSurface != null && stepUp > ownSurface;
+          this.setControlState('forward', true);
+          this.setControlState('jump', !!jumpNeeded);
+          if (Math.abs(dist) > 0.001) this._pfDriving = true;
         }
       }
-      // clamp to ground
-      const sy = this.world.surfaceY(Math.floor(e.position.x), Math.floor(e.position.z));
-      if (sy != null) e.position.y = sy + 1;
-    } else {
+      if (!this._pfDriving) {
+        const sy = this._surfaceAt(Math.floor(e.position.x), Math.floor(e.position.z));
+        if (sy != null) e.position.y = sy + 1;
+      }
+    } else if (this._pfDriving) {
+      // Release only the control states the pathfinder itself owned. Clearing
+      // them unconditionally would wipe whatever an actor (PvP, fight, flee) is
+      // deliberately holding while no path exists — which is the normal case for
+      // every control-driven behaviour in this project.
       this.pathfinder._moving = false;
-      e.velocity.set(0, 0, 0);
+      this._pfDriving = false;
+      this.clearControlStates();
     }
+
+    /* Terrain-driven locomotion from the raw control states.
+     *
+     * This is the piece the mock was missing. It used to teleport the bot onto
+     * `surfaceY` under whatever the goal driver produced, so a bot that never
+     * issued a jump still travelled fine offline — and every test of "does it
+     * climb steps?" passed while the live bot failed. Here the bot only moves as
+     * fast as its control states allow, and a one-block step requires
+     * forward+jump exactly like the real game. */
+    this._physicsTick();
 
     // zombie wanders toward the bot sometimes
     const zom = this.entities[9001];
@@ -372,6 +499,104 @@ class MockBot extends EventEmitter {
       this.entity.health = this.health;
       this.emit('health');
     }
+  }
+
+  /**
+   * Local physics: consumes control states and the world, and produces movement.
+   * Deliberately simple, but with the two behaviours the whole terrain fix
+   * depends on — a step needs a jump, and a cliff you did not agree to fall is
+   * refused rather than discovered.
+   */
+  _physicsTick() {
+    const e = this.entity;
+    const c = this._controls;
+    const dt = 0.12;                                   // matches the tick interval
+    const speed = (c.sprint ? 5.6 : 4.317) * (c.sneak ? 0.3 : 1);
+    const ground = this._groundY();      // top solid block of our own column
+
+    // vertical: gravity, then jump. The feet stand one above the surface block.
+    if (this._vy == null) this._vy = 0;
+    let onGround = Math.abs(e.position.y - (ground + 1)) < 0.01;
+    if (c.jump && (onGround || this._airborne)) {
+      if (this._vy === 0) { this._vy = 8.0; this._airborne = true; }
+    }
+    if (!c.jump && this._vy > 0 && this._airborne) this._vy = Math.max(0, this._vy - 12);
+
+    const yaw = e.yaw || 0;
+    let vx = 0, vz = 0;
+    // Same vectors as prismarine-physics applyHeading (the authority):
+    // forward = (-sin yaw, -cos yaw), right = (cos yaw, -sin yaw).
+    const fx = -Math.sin(yaw), fz = -Math.cos(yaw);
+    const rx = Math.cos(yaw), rz = -Math.sin(yaw);
+    if (c.forward) { vx += fx; vz += fz; }
+    if (c.back) { vx -= fx; vz -= fz; }
+    if (c.right) { vx += rx; vz += rz; }
+    if (c.left) { vx -= rx; vz -= rz; }
+    const vl = Math.hypot(vx, vz);
+    if (vl > 0.001) { vx = vx / vl * speed; vz = vz / vl * speed; }
+
+    // propose the move, then test it against the terrain
+    const nx = e.position.x + vx * dt;
+    const nz = e.position.z + vz * dt;
+    if (vl > 0.001) {
+      const targetGround = this._surfaceAt(Math.floor(nx), Math.floor(nz));
+      // Rise is surface-to-surface: our feet are one above our own surface, so
+      // comparing against feet makes a real step look flat and lets the bot
+      // walk through walls (which is what the old mock did, hiding the bug).
+      const rise = targetGround == null ? 0 : targetGround - ground;
+      if (rise >= 1 && !c.jump && this._vy <= 0) {
+        // blocked by a step we did not jump: stop dead, like the real game
+        vx = 0; vz = 0;
+        this._blockedAt = { x: Math.floor(nx), z: Math.floor(nz), rise };
+      } else if (targetGround == null) {
+        vx = 0; vz = 0;                                // unloaded chunk: no walking off the map
+      } else {
+        this._blockedAt = null;
+      }
+    }
+    e.position.x += vx * dt;
+    e.position.z += vz * dt;
+    e.velocity.set(vx, this._vy, vz);
+
+    const newGround = this._surfaceAt(Math.floor(e.position.x), Math.floor(e.position.z));
+    const fell = Math.max(0, (newGround == null ? ground : newGround) - 0);
+    if (this._vy > 0) {
+      e.position.y += this._vy * dt;
+      this._vy -= 20 * dt;
+      if (newGround != null && e.position.y >= newGround + 1) {
+        // landed
+        this._airborne = false;
+        this._vy = 0;
+        e.position.y = newGround + 1;
+      } else if (e.position.y <= newGround + 1) {
+        this._airborne = false;
+        e.position.y = newGround + 1;
+        this._vy = 0;
+      } else {
+        this._airborne = true;
+      }
+    } else if (newGround != null && e.position.y > newGround + 1) {
+      // free fall (walked off a ledge) — the honest version of what the old mock hid
+      e.position.y = Math.max(newGround + 1, e.position.y - 8 * dt);
+      this._airborne = e.position.y > newGround + 1;
+    } else if (newGround != null) {
+      e.position.y = newGround + 1;
+      this._airborne = false;
+    }
+    e.onGround = !this._airborne;
+    void fell;
+  }
+
+  /** Surface (top solid block) of a column, or null if outside the mock world. */
+  _surfaceAt(x, z) {
+    if (x < -HALF || x > HALF || z < -HALF || z > HALF) return null;
+    return this.world.surfaceY(x, z);
+  }
+
+  _groundY() {
+    const e = this.entity;
+    const s = this._surfaceAt(Math.floor(e.position.x), Math.floor(e.position.z));
+    return s == null ? e.position.y - 1 : s;
   }
 
   /* --- mineflayer-ish API used by Actor --- */
@@ -444,16 +669,60 @@ class MockBot extends EventEmitter {
   }
   activateItem() {}
   deactivateItem() {}
+  /**
+   * Attacking emits the same signals a real server would send back, because
+   * that is the only way to exercise the confirmed-hit path offline. Before this
+   * the mock returned a mutated `health` field and nothing else, so a bot whose
+   * perception relies on `animation`/`damage_event` saw no evidence at all in
+   * the demo and every offline run looked like the "no damage signal" case.
+   *
+   * Rules mirrored from mineflayer:
+   *   - animation 1 -> 'entityHurt'  (the hurt flash)
+   *   - damage_event -> 'entityHurt'(entity, source), source = the attacker
+   *   - status 3 -> 'entityDead'
+   * A swing at an entity with no health field (a vanilla player) still produces
+   * the hurt signal — servers do broadcast it — but not a health value, which is
+   * exactly the situation the estimate exists for.
+   */
   async attack(entity) {
-    if (entity && entity.health != null) {
+    if (!entity) return;
+    // Hitting something the world has already removed produces no packets at all.
+    // Emitting them anyway let the mock resurrect a corpse in the bot's own model.
+    if (entity.isValid === false) return;
+    this.emit('animation', { entityId: entity.id, animation: 1 });
+    this.emit('entityHurt', entity, this.entity);
+    if (entity.health != null) {
       entity.health -= 4;
-      if (entity.health <= 0) { entity.isValid = false; delete this.entities[entity.id]; }
+      if (entity.health <= 0) {
+        entity.isValid = false;
+        this.emit('entityDead', entity);
+        delete this.entities[entity.id];
+        this.emit('entityGone', entity);
+      } else {
+        this.emit('entityUpdate', entity);
+      }
     }
   }
   async look(yaw, pitch, force) { this.entity.yaw = yaw; this.entity.pitch = pitch; }
   async lookAt(pos, force) { this.entity.yaw = Math.atan2(-(pos.x - this.entity.position.x), (pos.z - this.entity.position.z)); }
-  setControlState(state, on) {}
-  jump() {}
+  /* Control states mirror the real mineflayer plugin: they are readable, they
+   * assert on an unknown name, and setting the same value twice is a no-op. The
+   * physics loop below consumes them, which is what lets the offline mock
+   * actually demonstrate climbing a step and refusing a cliff. */
+  setControlState(state, on) {
+    if (!(state in this._controls)) throw new Error(`invalid control: ${state}`);
+    const v = !!on;
+    if (this._controls[state] === v) return;
+    this._controls[state] = v;
+    if (state === 'jump' && v) this.jumpQueued = true;
+    this.controlChanges++;
+  }
+  getControlState(state) {
+    if (!(state in this._controls)) throw new Error(`invalid control: ${state}`);
+    return this._controls[state];
+  }
+  clearControlStates() { for (const k of Object.keys(this._controls)) this._controls[k] = false; }
+  jump() { this.setControlState('jump', true); }
   respawn() {
     this.health = 20; this.food = 20;
     this.emit('respawn');
@@ -467,6 +736,28 @@ class MockBot extends EventEmitter {
   }
 
   /* --- test helpers --- */
+  /** Make another entity attack the bot (or any target), with real signals. */
+  simulateAttack(target, damage = 3) {
+    const t = target || this.entity;
+    (this._timers || []);
+    this.emit('entitySwingArm', this.entities[3000] || this.entity);
+    if (t === this.entity) {
+      this.health = Math.max(0, +(this.health - damage).toFixed(1));
+      this.entity.health = this.health;
+      this.emit('health');
+      if (this.health === 0) this.emit('death');
+    } else {
+      this.emit('animation', { entityId: t.id, animation: 1 });
+      this.emit('entityHurt', t, this.entity);
+    }
+  }
+  /** Broadcast a player's gamemode the way player_info does. */
+  simulateGamemode(name, mode) {
+    const p = this.players[name];
+    if (!p) return;
+    p.gamemode = mode;
+    this.emit('playerUpdated', p);
+  }
   simulateKick(reason) { this.emit('kicked', reason || 'simulated kick'); }
   simulateDisconnect() { this._clientEnd('simulated disconnect'); }
   simulateChat(from, msg) { this.emit('chat', from, msg); }

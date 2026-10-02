@@ -16,7 +16,12 @@ const DEFAULTS = {
     initialDelayMs: 5000,
     maxDelayMs: 120000,
     multiplier: 1.75,
-    jitterMs: 2000
+    jitterMs: 2000,
+    // Stop hammering a server that has never accepted us. The backoff caps at
+    // maxDelayMs, so without a limit a wrong host/port means an endless cycle —
+    // observed as 694 connects over 24 hours against a dead address.
+    maxAttempts: 25,
+    exitOnGiveUp: true
   },
   antiIdle: {
     enabled: true,
@@ -42,10 +47,33 @@ const DEFAULTS = {
     canDig: true,           // let the pathfinder dig through obstacles
     allowSprinting: true,
     gotoRange: 3,
+    // Terrain budget handed to mineflayer-pathfinder's Movements. maxDropDown is
+    // capped at 2 because a 3-block drop starts fall damage AND the plugin will
+    // not plan the climb back up — that asymmetry is why the bot used to stick
+    // permanently after falling into a hole.
+    movements: { maxDropDown: 2 },
+    // PvP tuning. `reach` is the server's actual melee reach (Paper defaults it
+    // to ~4.5 for 1.21+); the bot never swings outside its own measured reach.
+    pvp: {
+      reach: 3.0,
+      retreatHp: 6,        // 3 hearts: pause/verify, not flee
+      safeHp: 12,
+      giveUpDist: 40,
+      engageRange: 20,
+      maxFightMs: 180000,
+      verifyMs: 4000,      // how long a "they look low" pause lasts before resuming
+      descendMax: 3,       // largest step down the duel will take to close on a target
+      autoEat: true,
+      // 'off' | 'assist' (advisor may only choose safe actions)
+      // | 'force' (advisor's choice is obeyed within the safety veto)
+      ai: 'off'
+    },
+    ai: { url: 'https://jevtypesafeai.com/api/jev', pvp: 'off' },
     home: null,             // {x,y,z}; defaults to the first spawn point
     wander: { radius: 64, minDelayMs: 2500 },
     gather: { radius: 96, maxLogs: 128 },
-    follow: { range: 3, reach: 6 }
+    follow: { range: 3, reach: 6 },
+    fight: { maxMs: 20000, swingCdMs: 600 }
   },
   render: {
     panoWidth: 256,

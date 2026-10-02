@@ -13,7 +13,16 @@
     "initialDelayMs": 5000,
     "maxDelayMs": 120000,
     "multiplier": 1.75,
-    "jitterMs": 2000
+    "jitterMs": 2000,
+    "maxAttempts": 25,
+    "exitOnGiveUp": true
+  },
+  "behaviors": {
+    "mode": "afk",
+    "survive": { "enabled": false, "fleeHealth": 10 },
+    "movements": { "maxDropDown": 2 },
+    "pvp": { "reach": 3.0, "descendMax": 3 },
+    "ai": { "pvp": "off" }
   },
   "antiIdle": {
     "enabled": true,

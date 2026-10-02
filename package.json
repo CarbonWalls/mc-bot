@@ -2,7 +2,7 @@
   "name": "afk-minecraft-bot",
   "version": "1.0.0",
   "private": true,
-  "description": "Passive AFK Minecraft bot for an online-mode=false Aternos server",
+  "description": "Minecraft AFK/PvP/survival bot with terrain-aware movement, an autonomous behaviour engine, a TUI dashboard and an `mc` CLI",
   "type": "commonjs",
   "main": "src/bot.js",
   "scripts": {
@@ -12,7 +12,9 @@
     "demo:tui": "node src/tui.js --demo",
     "probe": "python3 src/probe.py",
     "poll": "python3 src/poller.py",
-    "test": "node tests/run_tests.js"
+    "test": "node tests/run_tests.js",
+    "mc": "node bin/mc.js",
+    "link": "npm link --no-audit --no-fund"
   },
   "dependencies": {
     "minecraft-data": "^3.117.0",
@@ -22,5 +24,9 @@
   },
   "engines": {
     "node": ">=18"
+  },
+  "bin": {
+    "mc": "bin/mc.js",
+    "mc-bot": "bin/mc.js"
   }
 }

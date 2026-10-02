@@ -28,6 +28,13 @@ function makeActor(cfg = {}) {
   world.generate();
   const bot = new MockBot(world);
   bot._spawn();
+  // Freeze the mock's own 120ms physics timer. A test that awaits real time
+  // (which the async recovery now requires) would otherwise see the bot drift,
+  // and the watchdog would correctly decide it is NOT stuck — the right
+  // behaviour, but it makes a stall test vacuous. With the timer stopped the bot
+  // only moves when a test calls _tick(), so "stalled" means stalled.
+  for (const t of bot._timers) { clearInterval(t); clearTimeout(t); }
+  bot._timers = [];
   // Actor reads its settings from opts.config (mirroring how BotCore builds it).
   const actor = new Actor(bot, {
     config: {
@@ -85,22 +92,93 @@ function register({ test }) {
     assert.strictEqual(actor.stuckAttempts, 0, 'movement should reset the stall counter');
   });
 
-  test('repeated stalls give up and return the bot to AFK, not a hang', () => {
+  test('repeated stalls give up and return the bot to AFK, not a hang', async () => {
     const { actor, bot } = makeActor({ stuckTimeoutMs: 50, maxStuckAttempts: 2 });
     actor.setMode('goto');
     actor.goalDesc = { type: 'near', x: 500, y: 70, z: 500, range: 3 };   // unreachable
     bot.pathfinder._goal = actor.goalDesc;
     bot.pathfinder._moving = true;
-    // Re-arm the "stale" timestamps each tick: unstick() does not advance the
-    // clock, so without this every tick after the first looks current.
-    for (let i = 0; i < 3 && actor.mode !== 'afk'; i++) {
-      actor.goalStartedAt = Date.now() - 30000;
-      actor.lastMoveAt = Date.now() - 30000;
-      actor.lastPos = bot.entity.position.clone();
+    // A recovery is now an async sequence, so ticks must be driven over time
+    // rather than hammered synchronously. The contract is unchanged: after
+    // maxStuckAttempts completed recoveries the bot gives up and goes AFK.
+    const deadline = Date.now() + 30000;
+    let lastArmed = 0;
+    while (Date.now() < deadline && actor.mode !== 'afk') {
+      // keep the stall "stale" so the watchdog keeps firing between recoveries
+      if (!actor._recovering && Date.now() - lastArmed > 120) {
+        actor.goalStartedAt = Date.now() - 30000;
+        actor.lastMoveAt = Date.now() - 30000;
+        actor.lastPos = bot.entity.position.clone();
+        lastArmed = Date.now();
+      }
       actor.tick();
+      await new Promise(r => setTimeout(r, 60));
     }
     assert.strictEqual(actor.mode, 'afk',
-      'after maxStuckAttempts the bot must give up and go AFK rather than spin');
+      `after maxStuckAttempts the bot must give up and go AFK rather than spin (attempts=${actor.stuckAttempts})`);
+    actor.destroy();
+  });
+
+  test('one recovery at a time: ticks during an in-flight recovery must not stack attempts', async () => {
+    // The live failure this pins. A recovery takes seconds (walk+jump loop,
+    // then climbOut up to 2.6s, then a dig), but the 500ms tick kept re-entering
+    // unstick() and burned all four attempts in 1.5 seconds. Observed on a real
+    // server:
+    //     attempt=1 ... attempt=4, "giving up after repeated stalls"
+    //     climb result res=climbed        <-- the climb WORKED, after the give-up
+    // So the bot quit a hole it had already solved. The watchdog must wait for
+    // the attempt it started.
+    const { actor, bot } = makeActor({ stuckTimeoutMs: 10, maxStuckAttempts: 4 });
+    actor.setMode('goto');
+    actor.goalDesc = { type: 'near', x: 500, y: 70, z: 500, range: 3 };
+    bot.pathfinder._goal = actor.goalDesc;
+    bot.pathfinder._moving = true;
+    actor.goalStartedAt = Date.now() - 30000;
+    actor.lastMoveAt = Date.now() - 30000;
+    actor.lastPos = bot.entity.position.clone();
+
+    actor.tick();                                  // fires the first recovery
+    assert.ok(actor._recovering, 'the recovery should be in flight');
+    assert.strictEqual(actor.stuckAttempts, 1, 'exactly one attempt started');
+
+    // Hammer the watchdog for 2s the way the 500ms tick would, keeping the
+    // "no movement" condition true the whole time.
+    const until = Date.now() + 2000;
+    let ticks = 0;
+    while (Date.now() < until) {
+      actor.goalStartedAt = Date.now() - 30000;
+      actor.lastPos = bot.entity.position.clone();  // pretend it never moved
+      actor.tick();
+      ticks++;
+      await new Promise(r => setTimeout(r, 40));
+    }
+    assert.ok(ticks > 10, `the loop should have ticked many times, got ${ticks}`);
+    assert.ok(actor.stuckAttempts <= 2,
+      `a stall of 2s with slow recoveries must not burn the whole budget (attempts=${actor.stuckAttempts})`);
+    assert.notStrictEqual(actor.mode, 'afk',
+      'the bot must NOT have given up while a recovery was still working');
+    actor.destroy();
+  });
+
+  test('unstick() re-arms the stall clock so the in-flight attempt can finish', () => {
+    // Same bug, asserted directly and cheaply: if unstick did not move
+    // lastMoveAt forward, the very next tick (500ms later in the daemon) would
+    // see another stale clock and stack a second recovery on top of the first.
+    const { actor, bot } = makeActor({ stuckTimeoutMs: 100, maxStuckAttempts: 4 });
+    actor.goalDesc = { type: 'near', x: 500, y: 70, z: 500, range: 3 };
+    bot.pathfinder._goal = actor.goalDesc;
+    bot.pathfinder._moving = true;
+    actor.goalStartedAt = Date.now() - 30000;
+    actor.lastMoveAt = Date.now() - 30000;
+    const before = actor.lastMoveAt;
+    actor.unstick();
+    assert.ok(actor.lastMoveAt > before,
+      'starting a recovery must re-arm the clock the watchdog measures');
+    assert.strictEqual(actor.stuckAttempts, 1);
+    // and a second call while one runs is a no-op
+    actor.unstick();
+    assert.strictEqual(actor.stuckAttempts, 1, 're-entrancy must be refused');
+    actor.destroy();
   });
 
   test('no goal means the watchdog does nothing', () => {

@@ -397,6 +397,19 @@ class Tui {
       case '+': case '=': this.radarRadius = clamp(this.radarRadius + 4, 4, this.radarRadiusMax); this.flash('radar radius ' + this.radarRadius); this.pollRadar(); return true;
       case '-': case '_': this.radarRadius = clamp(this.radarRadius - 4, 4, this.radarRadiusMax); this.flash('radar radius ' + this.radarRadius); this.pollRadar(); return true;
       case 'e': this.sendExec('eat'); return true;
+      case 'p': {
+        // Duel the nearest visible player. Prompted rather than fired blind, so a
+        // stray keypress cannot start a fight with the wrong person.
+        const p = this.status && this.status.players && this.status.players[0];
+        this.prompt = { mode: 'pvp' };
+        this.input = p ? p.name : '';
+        this.flash('pvp <player> [tier] — enter to start');
+        this.scheduleRender();
+        return true;
+      }
+      case 'j': this.sendExec('jump').then(() => this.pollStatus()); this.flash('jumping'); return true;
+      case 'c': this.sendExec('climb').then(() => this.pollStatus()); this.flash('climbing out'); return true;
+      case 'h': this.sendExec('hearts').then(() => this.pollStatus()); return true;
       case 'f': this.sendExec('survive on').then(() => setTimeout(() => this.pollStatus(), 300)); this.flash('survive toggled'); return true;
       case 'd': this.daemonState = 'connecting'; this.connectOrSpawnDaemon(); return true;
       case 'q': this.quit(false); return true;
@@ -555,6 +568,10 @@ class Tui {
     s.cursorTo(0, 0);
     const title = ' AFK Minecraft Bot';
     const right = [
+      // The DEMO tag comes from the DAEMON's status, not this TUI's own flag:
+      // the TUI can attach to a demo daemon it did not start, and reading a demo
+      // duel as a live one is exactly the mistake worth avoiding on screen.
+      this.status && this.status.demo ? 'DEMO' : null,
       this.daemonState === 'online' ? (this.daemonPid ? `daemon ${this.daemonPid}` : 'daemon online') : 'daemon offline',
       this.status ? `${this.status.target}` : '',
       this.status ? `state:${this.status.state}` : 'state:unknown'
@@ -620,8 +637,22 @@ class Tui {
     row('yaw', st && st.yaw != null ? st.yaw.toFixed(1) + '°' : '-');
     const hp = st && st.health != null ? st.health : null;
     const food = st && st.food != null ? st.food : null;
-    row('health', hp != null ? `${hp}/20` : '-', hp != null && hp < 10 ? '\x1b[31m' : '\x1b[32m');
+    // Hearts, not just a float. The user asked the bot to "read the player's
+    // hearts", and a bare 15.0/20 is not how anyone judges a fight at a glance.
+    const hearts = (n) => n == null ? null : Math.max(0, Math.ceil(n / 2));
+    const bar = (n) => {
+      if (n == null) return '-';
+      const full = Math.max(0, Math.min(10, hearts(n)));
+      const half = (n - full * 2) > 0.01 && full < 10 ? 1 : 0;
+      return '\x1b[31m' + '\u2764'.repeat(full) + (half ? '\u2665' : '') +
+        '\x1b[2m' + '\u2661'.repeat(Math.max(0, 10 - full - half)) + '\x1b[0m ' + n.toFixed(1);
+    };
+    row('health', bar(hp), hp != null && hp < 10 ? '\x1b[31m' : '\x1b[32m');
     row('food', food != null ? `${food}/20` : '-', food != null && food < 8 ? '\x1b[33m' : '\x1b[32m');
+    if (st && st.gamemode) row('mode-gm', st.gamemode + (st.gamemode === 'creative' ? ' \x1b[33m(undeathable)\x1b[0m' : ''));
+    if (st && st.damage && st.damage.incomingDamage != null) {
+      row('last hit', `-${st.damage.incomingDamage} hp ${st.damage.lastHurtAgoMs != null ? `(${(st.damage.lastHurtAgoMs / 1000).toFixed(0)}s ago)` : ''}`);
+    }
     // Draw the trends only once there is more than one sample. The history is
     // appended here rather than above so hp/food are defined.
     const hpHist = (this._hpHist || []);
@@ -646,6 +677,27 @@ class Tui {
     row('stuck', a ? String(a.stuckAttempts) : '-');
     row('survive', a ? (a.survive ? 'on' : 'off') : '-', a && a.survive ? '\x1b[32m' : DIM);
     row('home', a && a.home ? `${a.home.x} ${a.home.y} ${a.home.z}` : '-');
+    // Ground state: the number that explains a stall. "ahead rise 1" means the
+    // bot is looking at a step it should be jumping; "climbing" means it is in a
+    // depression and hole-escape is armed. This is what made the flat-ground bug
+    // invisible, so it is now on the dashboard.
+    if (a && a.ground) {
+      const g = a.ground;
+      row('ground', `surf ${g.surface} rise ${g.aheadRise} drop ${g.aheadDrop}${g.onGround ? '' : ' (airborne)'}`);
+      if (g.climbing) row('climb', `exit rise ${g.exitRise}`, '\x1b[33m');
+    }
+    if (a && a.ai && a.ai !== 'off') row('ai', a.ai, '\x1b[36m');
+    // Live duel panel: what we observed, not what we guessed.
+    const pv = a && a.pvp;
+    if (pv && (pv.running || pv.result)) {
+      y++;
+      this.put(0, y, BOLD + 'DUEL' + RESET, w); y++;
+      row('vs', `${pv.target} t${pv.tier}${pv.running ? ' \x1b[36mfighting' : ' \x1b[2m' + (pv.result || '') + '\x1b[0m'}`);
+      row('opp hp', `${pv.opponent.healthEstimate} ~${pv.opponent.estimateHearts}\u2665 ${'\x1b[2m(' + pv.opponent.observedSource + ', ' + pv.opponent.gamemode + ')\x1b[0m'}`);
+      row('swings', `${pv.counts.swings} / conf ${pv.counts.confirmedHits} / none ${pv.counts.swingsWithNoEffect}`);
+      if (pv.resultReason) row('why', String(pv.resultReason).slice(0, 28), '\x1b[2m');
+      if (pv.ai && pv.ai.last) row('ai act', `${pv.ai.applied || pv.ai.last.action} c${(pv.ai.last.confidence || 0).toFixed(2)}`, '\x1b[36m');
+    }
 
     // Inventory panel: logs gathered, tool wear, and food on hand. Each line
     // is only drawn when there is something to show, so an empty inventory
@@ -843,6 +895,11 @@ class Tui {
       '  1 afk          2 hold         3 wander      4 gather wood',
       '  5 come home    6 follow <p>   7 goto x z    8 attack <name>',
       '',
+      'Combat',
+      '  p  pvp <player> [tier]   j jump (test terrain)   c climb out of a hole',
+      '  h  hearts — yours, or "hearts <player>" at the prompt',
+      '  tiers: rookie easy medium vet hard, or 0..1 continuous',
+      '',
       'Camera',
       '  s  render a 360° panorama to screenshots/ (shown here too)',
       '  r  toggle radar    +/-  zoom radar in/out',
@@ -852,13 +909,16 @@ class Tui {
       '',
       'Text commands (type at the prompt, Enter to run)',
       '  goto 120 -300   follow Steve 3   wander 80   gather 120',
-      '  come   home 120 64 -40   eat   survive on   afk   help',
+      '  come  home 120 64 -40  eat  survive on  afk  help',
+      '  pvp Steve hard   pvp Steve stop   hearts Steve   result',
+      '  ai assist | ai force | ai off   (external decision advisor)',
       '',
       'Other',
       '  d  (re)start daemon   q  quit TUI (daemon stays)   Q  quit both',
       '  ↑/↓ command history   Esc  clear input   Ctrl-C  leave TUI',
       '',
-      'The daemon runs headless as src/bot.js; this TUI just attaches to it.'
+      'The daemon runs headless as src/bot.js; this TUI just attaches to it.',
+      'Prefer the CLI for scripting:  mc pvp Steve hard   mc hearts Steve   mc result'
     ];
     for (let i = 0; i < lines.length && i < box.h - 3; i++) {
       this.put(box.x, box.y + 1 + i, lines[i], box.w);

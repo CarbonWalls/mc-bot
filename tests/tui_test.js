@@ -131,9 +131,10 @@ function register({ test }) {
     let release;
     const hang = new Promise(r => { release = r; });
     tui.connectOrSpawnDaemon = () => hang;
+    let starting;                      // declared outside try: `finally` uses it
 
     try {
-      const starting = tui.start();
+      starting = tui.start();
       // the connect is still pending while we press the key — this is the
       // window that used to swallow input
       await new Promise(r => setImmediate(r));

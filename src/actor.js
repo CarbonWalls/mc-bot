@@ -11,21 +11,28 @@
  *                          wander / gather / come, expressed as descriptors so
  *                          any goal can be rebuilt on demand (see unstick()).
  *   3. Anti-stuck watchdog — measures real movement; when the bot stalls it
- *                          jumps, clears whatever is in the way, and re-plans.
+ *                          JUMPS (forward + jump held together, which is the
+ *                          only combination that clears a step), clears whatever
+ *                          is in the way, climbs out of holes, and re-plans.
  *                          After repeated failure it gives up cleanly instead
  *                          of spinning forever.
  *   4. Survival layer    — opt-in reactive layer that runs on top of any mode:
  *                          auto-eat when hungry, flee when low, hit back when
- *                          hit, auto-respawn on death.
+ *                          hit, auto-respawn on death. Escape routes are scored
+ *                          against the actual terrain (see src/terrain.js)
+ *                          instead of assumed flat.
  *
  * Everything is opt-in. With the shipped config the bot behaves exactly like
  * the passive AFK bot it was before.
  */
 
 const fs = require('fs');
-const path = require('path');
 const { Vec3 } = require('vec3');
 const { pathfinder, Movements, goals } = require('mineflayer-pathfinder');
+const T = require('./terrain');
+const M = require('./movement');
+const { DamageTracker, ownGameMode, isUnkillable, gameModeOf, findByUsername, hearts } = require('./perceive');
+const { JevClient } = require('./jev');
 
 const {
   GoalNear, GoalBlock, GoalFollow, GoalGetToBlock, GoalXZ, GoalInvert, GoalCompositeAny
@@ -154,7 +161,45 @@ class Actor {
     // control states when it stops.
     this.pvp = null;
 
+    // Perception: real damage/health/gamemode signals from the server, so no
+    // behaviour has to decide "did I win?" from arithmetic alone.
+    this.tracker = null;
+
+    // External structured-decision advisor (src/jev.js). Constructed only when
+    // the config asks for it, so the default configuration makes no network
+    // calls and no behaviour depends on a third-party endpoint being up.
+    this.jev = null;
+    if (this._jevEnabled()) {
+      const a = this.cfg.ai || {};
+      this.jev = new JevClient({
+        logger: this.log,
+        enabled: true,
+        url: a.url,
+        ttlMs: a.ttlMs,
+        cooldownMs: a.cooldownMs
+      });
+    }
+
     this._wire();
+  }
+
+  /**
+   * AI is opt-in: only when cfg.ai.pvp (or cfg.ai.mode) names a mode. Off by
+   * default so a fresh install never reaches the network.
+   */
+  _jevEnabled() {
+    const a = this.cfg.ai;
+    if (!a) return false;
+    const mode = typeof a === 'string' ? a : (a.pvp || a.mode);
+    return !!mode && mode !== 'off';
+  }
+
+  /** AI mode string for the current config ('off' | 'assist' | 'force'). */
+  get aiMode() {
+    const a = this.cfg.ai;
+    if (!a) return 'off';
+    const mode = typeof a === 'string' ? a : (a.pvp || a.mode);
+    return mode && mode !== 'off' ? mode : 'off';
   }
 
   /* ------------------------------------------------------------------ *
@@ -172,6 +217,15 @@ class Actor {
 
     // 'spawn' is deliberately NOT wired here: core calls onSpawn() explicitly
     // after (re)attaching, which avoids double-handling on reconnect.
+    // One tracker per connection. It subscribes to entity events, so a tracker
+    // left attached to a dead bot would keep scoring a fight that ended and
+    // report health signals for entities the server has already forgotten.
+    if (this.tracker) { try { this.tracker.destroy(); } catch (_) {} }
+    this.tracker = new DamageTracker(bot, {
+      logger: this.log,
+      reach: (this.cfg.pvp && this.cfg.pvp.reach) || 3
+    });
+
     on('health', () => this.onHealth());
     on('death', () => {
       // Remember where we died so the recovery loop can come back for the
@@ -184,7 +238,10 @@ class Actor {
       this.log.warn('actor: died, clearing goal', { deathPos: this.deathPos });
       this._clearGoal();
       this.deaths = (this.deaths || 0) + 1;
-      if (this.survive && this.cfg.survive.autoRespawn !== false) {
+      // Optional-chained: a config with no `survive` block at all used to throw
+      // here while handling a death, which is the worst possible moment to throw.
+      const sv = this.cfg.survive || {};
+      if (this.survive && sv.autoRespawn !== false) {
         try { bot.respawn(); } catch (e) { this.log.debug('respawn failed', { error: e.message }); }
       }
     });
@@ -278,11 +335,15 @@ class Actor {
     this.log.info('actor: recovering dropped items', { at: target, ageS: +ageS.toFixed(0) });
     const prevMode = this.mode;
     try {
-      this.goalDesc = { type: 'near', x: target.x, y: target.y, z: target.z, range: 3 };
+      // Re-resolve the standing height: a drop lies on the floor, and the
+      // approach from world spawn can start at a completely different level.
+      const y = topSolidY(this.bot, target.x, target.z, target.y);
+      this.goalDesc = { type: 'near', x: target.x, y: y == null ? target.y : y + 1, z: target.z, range: 3 };
       this.goalStartedAt = Date.now();
       this._applyGoal(false);
       await this._awaitGoal(90000);
       this.log.info('actor: reached death point', { at: target });
+      this._pickupAround(5);
     } catch (e) {
       this.log.warn('actor: could not reach death point', { at: target, error: e.message });
     } finally {
@@ -306,6 +367,65 @@ class Actor {
     this._wire();
   }
 
+  /**
+   * Build a flee goal that the bot can actually reach.
+   *
+   * The old escape vector was `position*2 - threat`: pure x/z arithmetic that
+   * never looked at the world. On any map with relief it lands in a gully, on a
+   * ledge, or beyond a cliff the pathfinder will not descend — and when the
+   * pathfinder answers `path_stop`, the mode stayed set and the bot stood still
+   * while being eaten. `T.escapeSpot` scores a ring of candidate cells against
+   * the real terrain (distance from the threat, climbability, and whether the
+   * cell has any exit that is not the way we came), so the bot runs somewhere it
+   * can be.
+   *
+   * Home is preferred when it is a plausible escape, because a base is usually
+   * lit and walled for exactly this reason.
+   */
+  _fleeGoal(threat, opts = {}) {
+    const bot = this.bot;
+    if (!bot.entity) return null;
+    const s = this.cfg.survive || {};
+    if (this.home) {
+      const hd = Math.hypot(this.home.x - bot.entity.position.x, this.home.z - bot.entity.position.z);
+      const gap = threat ? Math.hypot(this.home.x - threat.position.x, this.home.z - threat.position.z) : 99;
+      if (hd <= (s.homeFleeMaxDist != null ? s.homeFleeMaxDist : 40) && gap > hd) {
+        return { type: 'near', x: this.home.x, y: this.home.y, z: this.home.z, range: 3 };
+      }
+    }
+    if (!threat) return null;
+    const spot = T.escapeSpot(bot, bot.entity.position, threat.position, {
+      radius: opts.radius || 12,
+      minGap: opts.minGap || 5
+    });
+    if (!spot) return null;
+    return { type: 'near', x: spot.x, y: spot.y, z: spot.z, range: 2 };
+  }
+
+  /** Start a flee: set the mode, aim at reachable ground, and run the loop. */
+  _beginFlee(threat, why) {
+    const bot = this.bot;
+    this.prevMode = (this.mode === 'afk' || this.mode === 'hold') ? 'afk' : this.mode;
+    this._preGoalMode = this.prevMode;
+    this.mode = 'flee';
+    this.stuckAttempts = 0;
+    this._recoverMark = bot.entity ? bot.entity.position.clone() : null;
+    this.fleeCount = (this.fleeCount || 0) + 1;
+    const goal = this._fleeGoal(threat);
+    if (goal) {
+      this.goalDesc = goal;
+      this._applyGoal(false);
+    }
+    this.log.warn('actor: fleeing', Object.assign({
+      why: why || 'damage',
+      health: +(bot.health != null ? bot.health : 20).toFixed(1),
+      hearts: hearts(bot.health),
+      threat: threat ? (threat.username || threat.name || threat.displayName) : null,
+      to: goal ? `${goal.x} ${goal.y} ${goal.z}` : 'no reachable escape found (holding)' 
+    }, {}));
+    this.fleeLoop().catch(e => this.log.debug('flee loop ended', { error: e.message }));
+  }
+
   onHealth() {
     const bot = this.bot;
     const h = bot.health != null ? bot.health : 20;
@@ -325,65 +445,78 @@ class Actor {
     // layer would otherwise fight it for the movement controls.
     if (this.mode === 'pvp') return;
 
-    // At night, melee mobs can close from spawning range to hitting range
-    // faster than a 20-tick poll notices, so raise the bar for staying: if one
-    // is inside `nightFleeRadius` (default 12) even at full health, run now
-    // rather than after the first hit. A zombie does ~3-4 damage per hit, so
-    // waiting to be hit at all is the expensive choice.
     const fleeHealth = s.fleeHealth != null ? s.fleeHealth : 10;
     const night = isNight(bot);
     const nightRadius = s.nightFleeRadius != null ? s.nightFleeRadius : 12;
-    if (night && h < fleeHealth + 4) {
+
+    // At night a melee mob closes from spawning range to hitting range faster
+    // than a 20-tick poll notices, so the bar for running is lower — but only
+    // when it is actually worth running. The previous condition was
+    // `night && h < fleeHealth + 4` while the comment claimed it fled "even at
+    // full health", and the effect people reported was the opposite of the
+    // intent: the bot bolted from fights it had already won. So: at night, flee
+    // a close hostile only when we are hurt OR outnumbered OR unarmed; otherwise
+    // stand and swing.
+    if (night) {
       const close = nearestHostile(bot, nightRadius);
       if (close) {
-        this.log.warn('actor: hostile close at night, fleeing before it hits', {
-          mob: close.name || close.username, distance: +bot.entity.position.distanceTo(close.position).toFixed(1)
-        });
-        this.prevMode = (this.mode === 'afk' || this.mode === 'hold') ? 'afk' : this.mode;
-        this._preGoalMode = this.prevMode;
-        this.mode = 'flee';
-        this.stuckAttempts = 0;
-        this.fleeCount = (this.fleeCount || 0) + 1;
-        if (this.home) {
-          this.goalDesc = { type: 'near', x: this.home.x, y: this.home.y, z: this.home.z, range: 4 };
-          this._applyGoal(false);
+        const crowd = countHostiles(bot, nightRadius) >= 2;
+        const armed = !!(bot.heldItem && /sword|axe/.test(bot.heldItem.name || ''));
+        const shouldRun = h < fleeHealth + 4 || crowd || !armed && h < 20;
+        if (shouldRun) {
+          this.log.warn('actor: hostile close at night', {
+            mob: close.name || close.username,
+            crowd,
+            armed,
+            distance: +bot.entity.position.distanceTo(close.position).toFixed(1)
+          });
+          this._beginFlee(close, 'night hostile');
+          return;
         }
-        this.fleeLoop().catch(e => this.log.debug('flee loop ended', { error: e.message }));
-        return;
       }
     }
 
     // Low health => run first, ask questions later.
     if (h < fleeHealth) {
-      this.log.warn('actor: taking damage, fleeing', { health: +h.toFixed(1) });
-      this.prevMode = (this.mode === 'afk' || this.mode === 'hold') ? 'afk' : this.mode;
-      this._preGoalMode = this.prevMode;
-      this.mode = 'flee';
-      this.stuckAttempts = 0;
-      this.fleeCount = (this.fleeCount || 0) + 1;
       const threat = nearestHostile(bot, 18);
-      if (threat && bot.entity) {
-        const away = bot.entity.position.scale(2).minus(threat.position);
-        const y = topSolidY(bot, Math.floor(away.x), Math.floor(away.z), Math.floor(bot.entity.position.y)) || Math.floor(bot.entity.position.y);
-        this.goalDesc = { type: 'near', x: Math.floor(away.x), y, z: Math.floor(away.z), range: 4 };
-        this._applyGoal(false);
-      }
-      this.fleeLoop().catch(e => this.log.debug('flee loop ended', { error: e.message }));
+      this._beginFlee(threat, `health ${+h.toFixed(1)}`);
       return;
     }
 
     // Otherwise hit the thing that is hitting us.
-    if (s.attack !== false) {
+    if (s.attack !== false && Date.now() - (this._lastFightArm || 0) > 1500) {
       const threat = nearestHostile(bot, 6);
       if (threat) {
-        this.log.warn('actor: hit back', { mob: threat.name || threat.username, health: +h.toFixed(1) });
-        this.prevMode = this.mode;
-        this.mode = 'fight';
-        this._fightTarget = threat;
-        this.hitCount = (this.hitCount || 0) + 1;
-        this.fightLoop().catch(e => this.log.debug('fight loop ended', { error: e.message }));
+        this.log.warn('actor: hit back', {
+          mob: threat.name || threat.username,
+          health: +h.toFixed(1),
+          hearts: hearts(h),
+          distance: bot.entity ? +bot.entity.position.distanceTo(threat.position).toFixed(1) : null
+        });
+        this._beginFight(threat, 'hit back');
       }
     }
+  }
+
+  /**
+   * Start (or retarget) a fight. Kept in one place so `onHealth`, the tick
+   * watchdog and a cornered flee all arm the same loop rather than each
+   * inventing their own copy of the state machine.
+   */
+  _beginFight(target, why) {
+    const bot = this.bot;
+    this.prevMode = (this.mode === 'afk' || this.mode === 'hold') ? (this.prevMode || 'afk') : this.mode;
+    this._preGoalMode = this.prevMode;
+    this.mode = 'fight';
+    this.stuckAttempts = 0;
+    this._lastFightArm = Date.now();
+    this._fightTarget = target;
+    this._fightStartedAt = Date.now();
+    this._lastFightStep = 0;
+    this.hitCount = (this.hitCount || 0) + 1;
+    if (this.tracker && target && target.id != null) this.tracker.setTarget(target);
+    this.log.info('actor: engaging', { why: why || 'order', mob: target && (target.username || target.name || target.displayName) });
+    this.fightLoop().catch(e => this.log.debug('fight loop ended', { error: e.message }));
   }
 
   /* ------------------------------------------------------------------ *
@@ -399,6 +532,36 @@ class Actor {
       const movements = new Movements(bot, bot.registry);
       movements.canDig = this.cfg.canDig !== false;
       movements.allowSprinting = this.cfg.allowSprinting !== false;
+
+      /* Terrain budget.
+       *
+       * What is actually adjustable, verified against the installed sources
+       * rather than assumed:
+       *   - mineflayer-pathfinder/lib/movements.js hard-codes
+       *       if (blockC.height - block0.height > 1.2) return
+       *     in two places, so a route may *plan* a 1-block climb and never a
+       *     2-block one, with no knob to change that. prismarine-physics has no
+       *     maxJumpHeight; `bot.physics.gravity` is a plain number (0.08).
+       *   - `movements.maxDropDown` is a real knob (default 4), and it is the
+       *     source of the asymmetry the user reported: the pathfinder happily
+       *     plans a 4-block drop, then cannot plan the 2-block climb back out.
+       *     That is precisely "gets stuck as soon as it falls by one or more
+       *     blocks": it falls, and the only route is a wall it will not scale.
+       *
+       * So: cap the descent at what does not cost health (a 3-block drop is the
+       * start of fall damage, so 2), and let anything taller than a single step
+       * be handled by the direct controller's jump-sneak block-hop
+       * (movement.climbOut), which is the only way to actually leave a 2-deep
+       * hole. Scaffolding (`allow1by1towers`) can also solve it, but only with
+       * dirt or cobble in the inventory, so it is a bonus, not a plan. */
+      const mcfg = this.cfg.movements || {};
+      const dropCap = mcfg.maxDropDown != null ? mcfg.maxDropDown : 2;
+      try { movements.maxDropDown = dropCap; } catch (_) {}
+      // Never path through lava/fire; keep digging on, but make it cost something
+      // so the pathfinder prefers a route around a wall to tunneling through it.
+      if (mcfg.digCost != null) { try { movements.digCost = mcfg.digCost; } catch (_) {} }
+      if (mcfg.liquidCost != null) { try { movements.liquidCost = mcfg.liquidCost; } catch (_) {} }
+      if (mcfg.scaffold !== false) { try { movements.allow1by1towers = true; } catch (_) {} }
       bot.pathfinder.setMovements(movements);
       this._movements = movements;
     } catch (e) {
@@ -459,7 +622,40 @@ class Actor {
     if (!bot || !bot.entity) return null;
     const y = topSolidY(bot, x, z, Math.floor(bot.entity.position.y));
     if (y == null) return null;
-    return { x, y, z };
+    // GoalBlock/GoalNear nodes are *foot* positions, so the standing cell is one
+    // above the surface block. Handing back the surface itself asks the bot to
+    // stand inside the ground: the pathfinder finds no route, emits path_stop,
+    // and the anti-idle shuffle freezes the bot in place.
+    const stand = y + 1;
+    // A shuffle step must be trivially walkable. Anything that would be a 2-block
+    // climb, a drop, or a head-bump is refused, because an anti-idle nudge that
+    // wanders off a cliff is worse than being kicked for idling.
+    const rise = Math.abs(stand - Math.floor(bot.entity.position.y));
+    if (rise > 1) return null;
+    const there = T.columnInfo(bot, x, z, bot.entity.position.y);
+    if (!there || there.headBlocked) return null;
+    if (there.dropBeyond > 2) return null;
+    return { x, y: stand, z };
+  }
+
+  /** Hostile count near the bot, exposed for the PvP controller's world facts. */
+  countHostilesNear(range) { return countHostiles(this.bot, range || 16); }
+
+  /**
+   * How the last (or current) duel ended, with the evidence. Both `result` and
+   * `pvp <name> result` reach this, so a CLI caller never has to guess which
+   * spelling exists.
+   */
+  pvpSummary() {
+    if (!this.pvp) return { ok: false, msg: 'no pvp fight recorded yet' };
+    const s = this.pvp.summary();
+    return {
+      ok: true,
+      msg: `${s.result || 'running'} — ${s.resultReason || ''} ` +
+           `(swings ${s.counts.swings}, confirmed ${s.counts.confirmedHits}, no-effect ${s.counts.swingsWithNoEffect}, ` +
+           `they hit us ${s.counts.hitsTakenByUs}; opponent ${s.opponent.healthEstimate} hp est = ${s.opponent.estimateHearts} hearts, ${s.opponent.gamemode})`,
+      data: s
+    };
   }
 
   /* ------------------------------------------------------------------ *
@@ -468,6 +664,7 @@ class Actor {
 
   get info() {
     const p = this.bot.entity ? this.bot.entity.position : null;
+    const s = this.bot;
     return {
       mode: this.mode,
       goal: this.goalDesc ? describeGoal(this.goalDesc) : null,
@@ -477,7 +674,68 @@ class Actor {
       home: this.home,
       pos: p ? { x: +p.x.toFixed(1), y: +p.y.toFixed(1), z: +p.z.toFixed(1) } : null,
       queue: this.queue ? this.queue.info : null,
-      deathPos: this.deathPos || null
+      deathPos: this.deathPos || null,
+      // Health in the unit players actually use, with the source of the number.
+      health: s.health != null ? +s.health.toFixed(1) : null,
+      hearts: hearts(s.health),
+      food: s.food != null ? s.food : null,
+      gamemode: ownGameMode(s) || null,
+      // What the bot is actually holding: the CLI's `--explain` and the duel
+      // panel need it to state weapon damage truthfully, and a missing field here
+      // showed up as "my weapon fist does ~1 damage" for a bot holding a diamond
+      // sword — a confidently wrong line in a debug tool is worse than no line.
+      heldItem: s.heldItem ? { name: s.heldItem.name, durability: s.heldItem.maxDurability
+        ? (s.heldItem.maxDurability - (s.heldItem.durabilityUsed || 0)) : null } : null,
+      ground: p ? this._groundFacts() : null,
+      ai: this.aiMode,
+      pvp: this.pvp ? this.pvp.summary() : null
+    };
+  }
+
+  /** What the terrain immediately around the bot looks like — for the TUI/CLI. */
+  _groundFacts() {
+    const bot = this.bot;
+    try {
+      const p = bot.entity.position;
+      const here = T.columnInfo(bot, Math.floor(p.x), Math.floor(p.z), p.y);
+      const ahead = M.probeAlong(bot, M.basis(bot).fx, M.basis(bot).fz);
+      const exit = M.bestExitDirection(bot, { hop: true });
+      return {
+        surface: here ? here.surface : null,
+        standY: here ? here.y : null,
+        feetAboveSurface: here ? +(p.y - (here.surface + 1)).toFixed(2) : null,
+        aheadRise: ahead ? ahead.rise : null,
+        aheadDrop: ahead ? ahead.drop : null,
+        onGround: M.onGround(bot),
+        inWater: M.inWater(bot),
+        climbing: !!(exit && exit.rise >= 1),
+        exitRise: exit ? exit.rise : null
+      };
+    } catch (_) { return null; }
+  }
+
+  /**
+   * Observed facts about another player: their game mode and any real health
+   * signal. This is what answers "can I even hit them?" without guessing, and
+   * what the CLI exposes as `mc hearts <name>`.
+   */
+  observePlayer(name) {
+    const bot = this.bot;
+    const pl = bot.players && (bot.players[name] || findByUsername(bot.players, name));
+    if (!pl) return { ok: false, msg: `no such player: ${name}` };
+    const gm = gameModeOf(bot, name);
+    const v = pl.entity && this.tracker ? this.tracker.of(pl.entity) : null;
+    return {
+      ok: true,
+      msg: `${name}: gamemode ${gm || 'unknown'}, health ${v ? v.health + ' (' + (v.source === 'server' ? 'observed' : 'estimated') + ')' : 'unknown'}, hearts ${v ? v.hearts : '?'}`,
+      data: {
+        name,
+        gamemode: gm,
+        visible: !!pl.entity,
+        distance: pl.entity && bot.entity ? +bot.entity.position.distanceTo(pl.entity.position).toFixed(1) : null,
+        vitals: v ? v.snapshot() : null,
+        killable: gm ? !isUnkillable(gm) : null
+      }
     };
   }
 
@@ -504,14 +762,31 @@ class Actor {
       case 'goto': {
         const p = parseCoords(args, bot);
         if (!p.ok) return { ok: false, msg: p.msg };
-        this.goalDesc = { type: p.exact ? 'block' : 'near', x: p.x, y: p.y, z: p.z, range: this.cfg.gotoRange || 3 };
+        // p.exact means the operator typed all three coordinates. Those are
+        // honoured literally (GoalBlock), NOT snapped: a live run printed
+        // "Going to -40 159 22" after the user asked for `-40 60 22`, because
+        // _snapToStandable moved an explicit Y to the surface under the column.
+        // Moving a coordinate the user chose is a silent override, and "the goal
+        // is unreachable" is the honest answer when it is. Two-coordinate goals
+        // (x z) ARE derived from the surface, so they still get snapped.
+        this.goalDesc = p.exact
+          ? { type: 'block', x: p.x, y: p.y, z: p.z }
+          : this._snapToStandable({ type: 'near', x: p.x, y: p.y, z: p.z, range: this.cfg.gotoRange || 3 });
         if (!this._applyGoal(false)) return { ok: false, msg: 'pathfinder unavailable' };
-        this.log.info('actor: going to', { target: { x: p.x, y: p.y, z: p.z } });
-        return { ok: true, msg: `Going to ${p.x} ${p.y} ${p.z}` };
+        this.log.info('actor: going to', {
+          target: { x: this.goalDesc.x, y: this.goalDesc.y, z: this.goalDesc.z },
+          exact: !!p.exact,
+          adjusted: this.goalDesc.x !== p.x || this.goalDesc.y !== p.y || this.goalDesc.z !== p.z
+        });
+        return {
+          ok: true,
+          msg: `Going to ${this.goalDesc.x} ${this.goalDesc.y} ${this.goalDesc.z}` +
+            (this.goalDesc.y !== p.y ? ` ${'(asked for y ' + p.y + ', surface is ' + this.goalDesc.y + ')'}` : '')
+        };
       }
       case 'come': {
         if (!this.home) return { ok: false, msg: 'no home known yet' };
-        this.goalDesc = { type: 'near', x: this.home.x, y: this.home.y, z: this.home.z, range: 3 };
+        this.goalDesc = this._snapToStandable({ type: 'near', x: this.home.x, y: this.home.y, z: this.home.z, range: 3 });
         if (!this._applyGoal(false)) return { ok: false, msg: 'pathfinder unavailable' };
         this.log.info('actor: coming home', { home: this.home });
         return { ok: true, msg: `Coming home (${this.home.x} ${this.home.y} ${this.home.z})` };
@@ -554,21 +829,48 @@ class Actor {
       case 'pvp': {
         // pvp <player> [tier 0..1]  — tier names map to numbers
         const name = args[0];
-        if (!name) return { ok: false, msg: 'usage: pvp <player> [rookie|medium|hard|0..1] [stop|hp <n>]' };
+        if (!name) return { ok: false, msg: 'usage: pvp <player> [rookie|medium|hard|0..1] [stop|hp <n>|result|ai <mode>] [ai off|assist|force]' };
         const sub = String(args[1] || '').toLowerCase();
         if (sub === 'stop' || sub === 'off') {
           return this.pvp && this.pvp.running ? this.pvp.stop('command') : { ok: false, msg: 'pvp not running' };
         }
+        if (sub === 'result' || sub === 'summary') return this.pvpSummary();
         if (sub === 'hp') {
           if (!this.pvp || !this.pvp.running) return { ok: false, msg: 'pvp not running' };
           const n = parseFloat(args[2]);
           if (!Number.isFinite(n)) return { ok: false, msg: 'usage: pvp <player> hp <n>' };
           return this.pvp.setHealth(n);
         }
+        // `pvp <name> ai assist|force|off` — change the advisor mid-fight
+        if (sub === 'ai') {
+          const mode = String(args[2] || 'assist').toLowerCase();
+          this.cfg.ai = mode === 'off' ? 'off' : { ...(this.cfg.ai || {}), pvp: mode };
+          if (mode !== 'off' && !this.jev) this.jev = new JevClient({ logger: this.log, enabled: true, url: (this.cfg.ai || {}).url });
+          if (this.pvp) { this.pvp.ai = this.aiMode; this.pvp.jev = this.jev; }
+          return { ok: true, msg: `ai advisor: ${this.aiMode}` };
+        }
         const tier = TIERNAMES[sub] != null ? TIERNAMES[sub] : (parseFloat(sub) || 0.5);
         const pl = bot.players && bot.players[name];
         if (!pl || !pl.entity) return { ok: false, msg: `cannot see player ${name}` };
-        if (!this.pvp) this.pvp = new PvpController(bot, { logger: this.log, actor: this, config: this.cfg });
+        if (!this.pvp) {
+          this.pvp = new PvpController(bot, {
+            logger: this.log,
+            actor: this,
+            config: this.cfg,
+            tracker: this.tracker,
+            jev: this.jev
+          });
+        }
+        // A reconnect replaces the bot, and with it the tracker: re-inject so the
+        // controller is never reading a Vitals object that belongs to a dead
+        // connection. Without this the controller falls back to its own private
+        // estimate and the observed-signals fix silently stops applying — which
+        // is exactly the "fled a fight it had won" bug.
+        if (this.pvp.tracker !== this.tracker) {
+          this.pvp.tracker = this.tracker;
+          this.pvp.vitals = this.tracker && this.tracker.of(pl.entity) || this.pvp.vitals;
+        }
+        if (!this.pvp.jev) this.pvp.jev = this.jev;
         // take the bot out of any pathing goal so the two never fight
         this._clearGoal();
         this.mode = 'pvp';
@@ -752,11 +1054,18 @@ class Actor {
     else this.log.debug('actor: tree yielded nothing reachable');
   }
 
-  /* Keep moving away from the threat until we are safe. Without this the
-   * bot flees once, then stands still and gets finished off. */
+  /* Keep moving away from the threat until we are safe. Without this the bot
+   * flees once, then stands still and gets finished off.
+   *
+   * Terrain-aware: it re-picks a *reachable* escape cell every few seconds
+   * rather than refreshing one arithmetic vector, and when nothing reachable
+   * exists (a box, a ledge with one way out) it stops pretending to flee and
+   * defends instead. A bot that walks into a wall while holding 'forward' is
+   * not fleeing, it is dying with extra steps. */
   async fleeLoop() {
     const bot = this.bot;
     let recomputeAt = 0;
+    let corneredAt = 0;
     while (this.mode === 'flee' && !this.destroyed) {
       const threat = nearestHostile(bot, 24);
       const s = this.cfg.survive || {};
@@ -768,19 +1077,56 @@ class Actor {
       }
       // refresh the escape route every few seconds as the threat follows
       if (bot.entity && Date.now() > recomputeAt) {
-        recomputeAt = Date.now() + 3000;
-        const away = bot.entity.position.scale(2).minus(threat.position);
-        const y = topSolidY(bot, Math.floor(away.x), Math.floor(away.z), Math.floor(bot.entity.position.y)) || Math.floor(bot.entity.position.y);
-        this.goalDesc = { type: 'near', x: Math.floor(away.x), y, z: Math.floor(away.z), range: 3 };
-        this._applyGoal(true);
+        recomputeAt = Date.now() + 2200;
+        const goal = this._fleeGoal(threat, { radius: 14 });
+        if (goal) {
+          corneredAt = 0;
+          this.goalDesc = goal;
+          // dynamic: the route must be recomputed as the pursuer moves
+          if (!this._applyGoal(true)) this._directFleeStep(threat);
+        } else {
+          // No reachable escape. Drive directly with the terrain-aware walker,
+          // which is strictly better at a one-block step than standing still.
+          if (!corneredAt) corneredAt = Date.now();
+          this._directFleeStep(threat);
+          if (Date.now() - corneredAt > 6000) {
+            this.log.warn('actor: nowhere to run, turning to fight', { health: +h.toFixed(1) });
+            this._beginFight(threat, 'cornered');
+            return;
+          }
+        }
       }
-      await sleep(400);
+      await sleep(350);
     }
   }
 
+  /** Flee with the direct controller, for when the pathfinder has no route. */
+  _directFleeStep(threat) {
+    const bot = this.bot;
+    try {
+      const away = bot.entity.position.minus(threat.position);
+      const len = Math.hypot(away.x, away.z) || 1;
+      const target = { x: bot.entity.position.x + away.x / len * 3, z: bot.entity.position.z + away.z / len * 3 };
+      M.walkToward(bot, target, { allowFall: true, maxDrop: 2, hop: true, sprint: true });
+    } catch (_) {}
+  }
+
+  /**
+   * Chase-and-swing loop.
+   *
+   * Two changes that matter for real terrain:
+   *   1. Closing uses the direct terrain-aware walker when the pathfinder has no
+   *      route, so a one-block step between us and a mob is jumped rather than
+   *      stood against. A follow-goal alone is not enough: the pathfinder can
+   *      legitimately return "no route" for a target standing on a ledge above
+   *      us, and a mob does not care that our router gave up.
+   *   2. The overwhelmed retreat now picks *reachable* ground (see _fleeGoal),
+   *      which is the difference between running home and running into a wall.
+   */
   async fightLoop() {
     const bot = this.bot;
     const startedAt = Date.now();
+    const maxMs = this.cfg.fight && this.cfg.fight.maxMs ? this.cfg.fight.maxMs : 20000;
     let swaps = 0, lastTarget = null;
     while (this.mode === 'fight' && !this.destroyed) {
       const target = this._fightTarget;
@@ -791,37 +1137,51 @@ class Actor {
         return;
       }
       // If we keep getting bounced to new targets (a swarm), fighting is not
-      // going to end. After ~20s give up the offence and run for home, which
-      // is how a player behaves at night — otherwise gather is impossible.
+      // going to end. After the budget give up the offence and run for home,
+      // which is how a player behaves at night — otherwise gather is impossible.
       if (lastTarget && lastTarget !== e) swaps++;
       lastTarget = e;
-      const tooLong = Date.now() - startedAt > 20000;
+      const tooLong = Date.now() - startedAt > maxMs;
       const swarmed = swaps > 4;
       if (tooLong || swarmed) {
-        this.log.warn('actor: overwhelmed, retreating home', { swaps, seconds: +((Date.now() - startedAt) / 1000).toFixed(1) });
+        this.log.warn('actor: overwhelmed, retreating home', {
+          swaps, seconds: +((Date.now() - startedAt) / 1000).toFixed(1)
+        });
         // Retreat, then go back to whatever we were doing once it is safe —
         // giving up on the whole goal because of one bad night is the
         // "stuck halfway" failure this bot exists to avoid.
         this.prevMode = this._preGoalMode || this.prevMode || 'afk';
-        this.mode = 'flee';
-        this.stuckAttempts = 0;
-        if (this.home) {
-          this.goalDesc = { type: 'near', x: this.home.x, y: this.home.y, z: this.home.z, range: 3 };
-          this._applyGoal(false);
-        }
-        this.fleeLoop().catch(e2 => this.log.debug('flee loop ended', { error: e2.message }));
+        this._beginFlee(e, swarmed ? 'swarmed' : 'fight budget exceeded');
         return;
       }
       try { bot.lookAt(e.position.offset(0, 1.2, 0), true); } catch (_) {}
       const dist = bot.entity.position.distanceTo(e.position);
-      if (dist > 2.6) {
+      if (dist > 2.4) {
+        // Prefer the pathfinder (it routes around things), but do not depend on
+        // it: if it is not moving us, walk toward the mob directly and jump.
         this.goalDesc = { type: 'follow', range: 1, reach: 2, resolve: () => e };
-        if (!bot.pathfinder || !currentGoal(bot)) this._applyGoal(true);
+        if (!bot.pathfinder || !isPathingNow(bot)) this._applyGoal(true);
+        if (isPathingNow(bot)) {
+          M.clearAll(bot);
+        } else if (Date.now() - this._lastFightStep > 120) {
+          this._lastFightStep = Date.now();
+          M.walkToward(bot, { x: e.position.x, z: e.position.z }, {
+            allowFall: true, maxDrop: 2, hop: true, sprint: dist > 6
+          });
+        }
       } else {
-        try { if (!this._attackCd || Date.now() - this._attackCd > 600) { await bot.attack(e); this._attackCd = Date.now(); } } catch (_) {}
+        M.clearAll(bot);
+        // Cooldown discipline: 1.9+ damage scales with swing charge, so spamming
+        // at 100 ms does ~1 damage per hit and leaves you open. Swing when charged.
+        const cd = this.cfg.fight && this.cfg.fight.swingCdMs ? this.cfg.fight.swingCdMs : 600;
+        if (!this._attackCd || Date.now() - this._attackCd > cd) {
+          this._attackCd = Date.now();
+          try { await bot.attack(e); } catch (_) {}
+        }
       }
-      await sleep(300);
+      await sleep(200);
     }
+    M.clearAll(bot);
   }
 
   /* ------------------------------------------------------------------ *
@@ -839,7 +1199,14 @@ class Actor {
       const z = Math.floor(origin.z + Math.sin(ang) * dist);
       const y = topSolidY(bot, x, z, origin.y);
       if (y == null) continue;
-      return { x, y, z };
+      // Pick only columns the bot can actually stand in: the surface block is
+      // under the feet, so the goal is y+1, and that cell plus headroom must be
+      // free. Without this, wander asked the pathfinder to occupy solid ground
+      // and it answered path_stop.
+      const col = T.columnInfo(bot, x, z, origin.y);
+      if (!col || col.headBlocked) continue;
+      if (col.dropBeyond > 3) continue;           // do not wander onto a ledge
+      return { x, y: col.y, z };
     }
     return null;
   }
@@ -996,6 +1363,19 @@ class Actor {
       this.stuckAttempts = 0;     // moving again: forgive past stalls
     }
 
+    /* Proactive assistance. The watchdog above only fires after 6 s of nothing,
+     * and by then the pathfinder has usually already decided the route is dead.
+     * Halfway to that threshold — 2.5 s with a live goal and no progress — drive
+     * toward the goal ourselves for a moment, jumping what is in front of us.
+     * This is the cheap fix for "stalled on a one-block step": the bot hops over
+     * it instead of escalating to dig / invert / give up. It never fights the
+     * pathfinder for long, because a single successful hop resets lastMoveAt. */
+    if (pathing && settled && now - this.lastMoveAt > Math.min(2500, (this.cfg.stuckTimeoutMs || 6000) / 2) &&
+      now - (this._assistAt || 0) > 1500 && !this._recovering) {
+      this._assistAt = now;
+      this._assist();
+    }
+
     // hard goal timeout
     if (pathing && this.goalStartedAt && now - this.goalStartedAt > (this.cfg.goalTimeoutMs || 300000)) {
       this.log.warn('actor: goal timed out, giving up', { timeoutMs: this.cfg.goalTimeoutMs || 300000 });
@@ -1004,55 +1384,293 @@ class Actor {
 
     // Run the survival layer whenever it is explicitly enabled OR the bot is
     // pursuing an active goal (see survivalTick): an undefended bot dies and
-    // never completes its task.
-    if (this.survive || this.mode !== 'afk') this.survivalTick(now);
+    // never completes its task. `hold` is deliberately included: standing ground
+    // means defending it, and the one mode that must be excluded is `pvp`, whose
+    // own controller owns the movement controls. Leaving pvp out is not cosmetic:
+    // survivalTick's flee branch and the PvP loop both drive `forward`/`back`, so
+    // when both were armed they cancelled each other out and the bot froze in
+    // place mid-duel while taking hits.
+    if (this.survive || (this.mode !== 'afk' && this.mode !== 'pvp')) this.survivalTick(now);
+  }
+
+  /**
+   * Fix a goal's Y so it names a cell the bot can stand in, keeping X/Z.
+   *
+   * A goal whose destination column is not standable — a ledge, the rim of a
+   * hole, a coordinate in mid-air — has no route, and the pathfinder answers
+   * with `path_stop`, which the old code treated as "give up". Snapping the
+   * target to the actual surface converts a permanent failure into a short walk,
+   * and it is the same reason `antiIdleTarget` refuses a bad column.
+   */
+  _snapToStandable(desc) {
+    const bot = this.bot;
+    if (!bot.entity || !desc) return desc;
+    // GoalBlock is only ever produced for coordinates the operator typed in
+    // full, so its y is a request, not a guess - adjusting it would be the
+    // silent override that made `goto -40 60 22` announce y=159 on a live server.
+    if (desc.type === 'block') return desc;
+    if (desc.type !== 'near' && desc.type !== 'xz') return desc;
+    const here = bot.entity.position;
+    const top = topSolidY(bot, desc.x, desc.z, here.y);
+    if (top == null) return desc;                     // unloaded: leave it alone
+    const stand = top + 1;
+    const range = desc.range != null ? desc.range : (this.cfg.gotoRange || 3);
+    if (Math.abs(stand - desc.y) <= Math.max(1, range - 1)) return desc;   // already sane
+    if (!T.isStandable(bot, desc.x, stand, desc.z)) {
+      // The standing cell itself is unusable (filled at feet or head, or no
+      // floor): aim one above and widen slightly so the pathfinder may stop on
+      // any neighbouring column of the same surface instead of reporting no route.
+      return Object.assign({}, desc, { type: 'near', y: stand + 1, range: Math.max(range, 2) });
+    }
+    this.log.debug('actor: snapped goal to standable height', { x: desc.x, z: desc.z, from: desc.y, to: stand });
+    return Object.assign({}, desc, { type: 'near', y: stand, range });
+  }
+
+  /**
+   * Collect nearby item entities.
+   *
+   * Walking back to where we died is only half of a recovery: the drops are
+   * entities floating above the floor, and a bot that arrives, looks around, and
+   * leaves has walked two hundred blocks for nothing. This build of mineflayer
+   * has no `collectItem`; `useOn(entity)` is the supported way to interact with
+   * an item entity, so that is what is used, guarded by a feature check so an
+   * older or newer build cannot throw here. A failed pickup is counted and
+   * logged, never thrown: one unreachable drop is not a reason to abandon the
+   * task that follows.
+   */
+  _pickupAround(radius) {
+    const bot = this.bot;
+    if (!bot.entity || !bot.entities) return 0;
+    let found = 0, done = 0;
+    for (const id in bot.entities) {
+      const e = bot.entities[id];
+      if (!e || !e.position || e === bot.entity) continue;
+      if (e.isValid === false) continue;
+      const kind = String(e.kind || e.type || '').toLowerCase();
+      const name = String(e.displayName || e.name || e.type || '').toLowerCase();
+      if (!/item|drop|object/.test(kind) && !/item/.test(name)) continue;
+      if (bot.entity.position.distanceTo(e.position) > radius) continue;
+      found++;
+      try {
+        if (typeof bot.useOn === 'function') { bot.useOn(e); done++; }
+      } catch (_) { /* unreachable drop: not worth a stack trace */ }
+    }
+    if (found) this.log.info('actor: drops nearby', { found, attempted: done, radius });
+    return found;
+  }
+
+  /**
+   * Recover from a stall.
+   *
+   * WHY THE OLD VERSION DID NOT WORK
+   * --------------------------------
+   * It pulsed `jump` for 500 ms and nothing else. In Minecraft a jump only
+   * clears an obstruction if `forward` is ALSO held on the tick of the
+   * collision — pressing jump against a one-block step moves you exactly zero
+   * blocks, which is why the bot appeared completely unable to jump and "only
+   * worked on flat ground". Four of those pulses later it declared the goal
+   * unreachable and went AFK, still standing in the hole it had fallen into.
+   *
+   * WHAT IT DOES NOW, in order of how cheap the fix is
+   * ---------------------------------------------------
+   *   1. Walk toward the goal *while jumping* (movement.walkToward, which also
+   *      does a jump-sneak hop onto a 2-block step). This alone clears most stalls.
+   *   2. If we are in a depression, find the best exit direction and climb out
+   *      before re-planning — the "stuck after falling one block" case, solved
+   *      directly instead of hoping the pathfinder reroutes around it.
+   *   3. Dig the block actually blocking us: the cell toward the goal, not the
+   *      one we happen to be facing (a stalled pathfinder has stopped turning).
+   *   4. Re-plan with a terrain-checked goal: a target that is not standable from
+   *      here has no route, so snap it to the nearest reachable surface first.
+   *   5. Only then invert the goal, and only then give up.
+   *
+   * The recovery is an async sequence because the controls have to be ours for
+   * the duration; handing the goal back to the pathfinder mid-jump just restarts
+   * the argument between the two drivers.
+   */
+  /**
+   * A short, self-limiting burst of direct control while a path is nominally
+   * live. Skipped entirely for PvP (the controller owns the controls there) and
+   * while an async recovery is already running.
+   */
+  _assist() {
+    const bot = this.bot;
+    if (this.mode === 'pvp' || !bot.entity || !this.goalDesc) return;
+    const heading = this._goalHeading(this.goalDesc);
+    if (!heading) return;
+    M.walkToward(bot, heading, { allowFall: true, maxDrop: 2, hop: true, jumpAlways: false, sprint: false });
+    // release quickly: the pathfinder resumes on its own next tick
+    const t = setTimeout(() => {
+      if (this.mode !== 'pvp' && !this._recovering) M.clearAll(bot);
+    }, 500);
+    if (t.unref) t.unref();
   }
 
   unstick() {
     const bot = this.bot;
+    /* A recovery is an async sequence — walk+jump for ~1.7 s, then climbOut for
+     * up to 2.6 s, then a dig. While it is running the tick still sees "no
+     * movement", so it re-entered unstick() every 500 ms and burned all four
+     * attempts in 1.5 seconds: observed live, the watchdog logged
+     *     attempt=1 ... attempt=4, "giving up after repeated stalls"
+     * and only *after* that did "climb result res=climbed" arrive — the climb
+     * worked, and the bot had already quit and gone AFK in the hole. That is the
+     * user's original "gets stuck as soon as it falls" bug, still reproducible.
+     *
+     * So: one recovery at a time, and each start re-arms the stall clock so the
+     * watchdog waits for the in-flight attempt instead of stacking new ones.
+     */
+    if (this._recovering) return;
     this.stuckAttempts++;
     const attempt = this.stuckAttempts;
     const cap = this.cfg.maxStuckAttempts || 4;
-    this.log.warn('actor: stuck, recovering', { attempt, mode: this.mode });
+    const p = bot.entity ? bot.entity.position : null;
+    this.log.warn('actor: stuck, recovering', {
+      attempt, mode: this.mode,
+      pos: p ? { x: +p.x.toFixed(1), y: +p.y.toFixed(1), z: +p.z.toFixed(1) } : null
+    });
 
     if (attempt >= cap) {
       this.log.warn('actor: giving up after repeated stalls', { attempts: attempt });
+      this._clearGoal();
+      M.clearAll(bot);
       this.setMode('afk');
       return;
     }
+    // Re-arm the timer the watchdog measures, so the next attempt can only happen
+    // once this one has finished and still produced nothing.
+    this.lastMoveAt = Date.now();
+    this._recover(attempt, cap).catch(e => this.log.debug('actor: recovery failed', { error: e.message }));
+  }
 
-    // 1) jump
+  async _recover(attempt, cap) {
+    const bot = this.bot;
+    const desc = this.goalDesc;
+    if (!desc) return;
+    this._recovering = true;
     try {
-      if (typeof bot.setControlState === 'function') {
-        bot.setControlState('jump', true);
-        setTimeout(() => { try { bot.setControlState('jump', false); } catch (_) {} }, 500);
-      }
-    } catch (_) {}
+      await this._recoverInner(attempt, cap, desc, bot);
+    } finally {
+      this._recovering = false;
+    }
+  }
 
-    // 2) clear whatever is directly in the way, if we are allowed to dig
-    if (this.cfg.canDig !== false && typeof bot.dig === 'function') {
+  async _recoverInner(attempt, cap, desc, bot) {
+    this._recoverMark = bot.entity ? bot.entity.position.clone() : null;
+    // Re-arm at every phase boundary: a long dig or a slow climb must not be
+    // mistaken for a fresh stall the moment it completes.
+    const reArm = () => { this.lastMoveAt = Date.now(); };
+
+    // 1) walk toward the goal *with* jumping
+    const heading = this._goalHeading(desc);
+    if (heading) {
+      for (let i = 0; i < 12 && this.goalDesc === desc && !this.destroyed && this.mode !== 'pvp'; i++) {
+        // alternate a forced hop with a terrain-decided step, so a bot stuck on
+        // a slab/fence edge still gets lift
+        const way = M.walkToward(bot, heading, {
+          allowFall: true, maxDrop: 2, hop: true, sprint: false, jumpAlways: i % 2 === 0
+        });
+        if (way === 'blocked' && i > 3) break;
+        await sleep(140);
+      }
+      M.clearAll(bot);
+      reArm();
+      if (this._progressSince()) {
+        this.log.info('actor: recovered by jumping the obstacle', { attempt });
+        this.stuckAttempts = Math.max(0, attempt - 2);   // a real recovery buys back budget
+        this._replan(desc, attempt, cap);
+        return;
+      }
+    }
+
+    // 2) are we in a hole? One block is enough to strand a bot whose only route
+    //    was straight up, and the pathfinder will not plan a 2-block climb.
+    const exit = M.bestExitDirection(bot, { hop: true });
+    if (exit && exit.rise >= 1) {
+      this.log.info('actor: climbing out', { rise: exit.rise, dx: exit.dx, dz: exit.dz });
+      const res = await M.climbOut(bot, { timeoutMs: 2600, hop: true });
+      M.clearAll(bot);
+      reArm();
+      this.log.info('actor: climb result', { res });
+      if (res === 'climbed') {
+        this.stuckAttempts = Math.max(0, attempt - 1);
+        this._replan(desc, attempt, cap);
+        return;
+      }
+    }
+
+    // 3) dig what is actually in the way, toward the goal
+    if (this.cfg.canDig !== false && typeof bot.dig === 'function' && heading) {
       try {
-        const eye = bot.entity.position.offset(0, bot.entity.eyeHeight || 1.6, 0);
-        const yaw = bot.entity.yaw || 0;
-        const fwd = { x: eye.x - Math.sin(yaw), y: eye.y, z: eye.z + Math.cos(yaw) };
-        const ahead = bot.blockAt(probe(Math.floor(fwd.x), Math.floor(eye.y), Math.floor(fwd.z)));
-        const feet = bot.blockAt(probe(Math.floor(fwd.x), Math.floor(bot.entity.position.y), Math.floor(fwd.z)));
-        const block = (ahead && ahead.name !== 'air') ? ahead : feet;
-        if (block && block.name !== 'air' && block.name !== 'bedrock') {
-          this.equipToolFor(block.name).then(() => bot.dig(block, true).catch(() => {}));
+        const pos = bot.entity.position;
+        const dx = Math.sign(heading.x - pos.x), dz = Math.sign(heading.z - pos.z);
+        const cells = [
+          [Math.floor(pos.x + dx), Math.floor(pos.y), Math.floor(pos.z + dz)],
+          [Math.floor(pos.x + dx), Math.floor(pos.y + 1), Math.floor(pos.z + dz)],
+          [Math.floor(pos.x), Math.floor(pos.y), Math.floor(pos.z)],
+          [Math.floor(pos.x + dx), Math.floor(pos.y - 1), Math.floor(pos.z + dz)]
+        ];
+        for (const [x, y, z] of cells) {
+          const b = bot.blockAt(probe(x, y, z));
+          if (!b || b.name === 'air' || b.name === 'bedrock') continue;
+          if (!T.isSolidBlock(b)) continue;
+          this.log.info('actor: digging the obstruction', { block: b.name, at: [x, y, z] });
+          await this.equipToolFor(b.name);
+          bot.dig(b, true).catch(() => {});
+          await sleep(900);
+          reArm();
+          break;
         }
       } catch (e) { this.log.debug('actor: unstick dig failed', { error: e.message }); }
     }
 
-    // 3) re-plan from scratch, and if that keeps failing, invert the goal so
-    //    the bot at least moves away from whatever corner it is in
-    const desc = this.goalDesc;
-    if (desc) {
-      if (attempt === cap - 1) {
-        this.goalDesc = { type: 'invert', inner: desc };
-      }
-      this._applyGoal(false);
+    this._replan(desc, attempt, cap);
+  }
+
+  /** Where the current goal is, in x/z, for direct-controller driving. */
+  _goalHeading(desc) {
+    const bot = this.bot;
+    if (!bot.entity || !desc) return null;
+    if (desc.type === 'near' || desc.type === 'block' || desc.type === 'xz') return { x: desc.x, z: desc.z };
+    if (desc.type === 'follow' && desc.resolve) {
+      const e = desc.resolve();
+      return e && e.position ? { x: e.position.x, z: e.position.z } : null;
     }
+    if (desc.type === 'invert' && desc.inner) {
+      const h = this._goalHeading(desc.inner);
+      if (!h) return null;
+      // away from the inner goal, at a reachable distance
+      const p = bot.entity.position;
+      return { x: p.x + (p.x - h.x), z: p.z + (p.z - h.z) };
+    }
+    return null;
+  }
+
+  /** True when the bot has moved meaningfully since the recovery checkpoint. */
+  _progressSince() {
+    const bot = this.bot;
+    if (!bot.entity || !this._recoverMark) return false;
+    return bot.entity.position.distanceTo(this._recoverMark) > 0.6;
+  }
+
+  /**
+   * Re-issue the goal after a recovery, but not necessarily at the same target:
+   * a goal that is not standable from here is snapped to reachable ground first,
+   * and only the last attempt inverts (so the bot at least leaves the corner).
+   */
+  _replan(desc, attempt, cap) {
+    const bot = this.bot;
+    if (!this.goalDesc || this.goalDesc !== desc || this.destroyed) return;
+    const next = this._snapToStandable(desc);
+    if (attempt >= cap - 1) {
+      this.goalDesc = { type: 'invert', inner: next };
+    } else {
+      this.goalDesc = next;
+    }
+    this._recoverMark = bot.entity ? bot.entity.position.clone() : null;
+    this.goalStartedAt = Date.now();
+    this._applyGoal(false);
+    this.lastMoveAt = Date.now();
   }
 
   survivalTick(now) {
@@ -1070,19 +1688,8 @@ class Actor {
 
     // flee when low — only when survival is enabled, or we are on an active goal
     if (defend && health < (s.fleeHealth != null ? s.fleeHealth : 10) && this.mode !== 'flee' && this.mode !== 'fight') {
-      this.log.warn('actor: low health, fleeing', { health });
-      this.prevMode = (this.mode === 'afk' || this.mode === 'hold') ? 'afk' : this.mode;
-      this._preGoalMode = this.prevMode;
-      this.mode = 'flee';
-      this.stuckAttempts = 0;
       const threat = nearestHostile(bot, 16);
-      if (threat && bot.entity) {
-        const away = bot.entity.position.scale(2).minus(threat.position);
-        const y = topSolidY(bot, Math.floor(away.x), Math.floor(away.z), Math.floor(bot.entity.position.y)) || Math.floor(bot.entity.position.y);
-        this.goalDesc = { type: 'near', x: Math.floor(away.x), y, z: Math.floor(away.z), range: 4 };
-        this._applyGoal(false);
-      }
-      this.fleeLoop().catch(e => this.log.debug('flee loop ended', { error: e.message }));
+      this._beginFlee(threat, `low health ${+health.toFixed(1)}`);
       if (food < 18) this.eat().catch(() => {});
     } else if (this.mode === 'flee' && health >= (s.fleeHealth != null ? s.fleeHealth : 10) + 6) {
       this.log.info('actor: recovered, resuming', { mode: this.prevMode });
@@ -1099,15 +1706,18 @@ class Actor {
       this.eat().catch(() => {});
     }
 
-    // hit back
-    if (defend && s.attack !== false && now - this.lastHurtAt < 4000 && this.mode !== 'fight' && this.mode !== 'flee') {
+    // hit back. onHealth() already reacts on the damage packet itself, so this
+    // is the safety net for a hurt that arrived without a health change (a
+    // shield bash, knockback from an untracked mob). It must not re-arm every
+    // tick inside the 4 s window: each _beginFight overwrites prevMode, so a
+    // repeating trigger corrupts the mode we are supposed to restore.
+    if (defend && s.attack !== false && now - this.lastHurtAt < 4000 &&
+      this.mode !== 'fight' && this.mode !== 'flee' && now - (this._lastFightArm || 0) > 3000) {
       const threat = nearestHostile(bot, 6);
       if (threat) {
-        this.log.warn('actor: hit back', { mob: threat.name || threat.username });
-        this.prevMode = this.mode;
-        this.mode = 'fight';
-        this._fightTarget = threat;
-        this.fightLoop().catch(e => this.log.debug('fight loop ended', { error: e.message }));
+        this._lastFightArm = now;
+        this.log.warn('actor: hit back', { mob: threat.name || threat.username, hearts: hearts(bot.health) });
+        this._beginFight(threat, 'hit back (tick)');
       }
     }
   }
@@ -1172,13 +1782,48 @@ class Actor {
         this.log.info('actor: survival layer toggled', { survive: on });
         return { ok: true, msg: `survival layer ${on ? 'on' : 'off'}` };
       }
+      case 'hearts': case 'hp': case 'vitals': {
+        // mc hearts [player]  — our own hearts, or an observed player's
+        if (!args.length) {
+          const h = this.bot.health;
+          return { ok: true, msg: `self: ${h != null ? h.toFixed(1) : '?'} hp = ${hearts(h)} hearts (gamemode ${ownGameMode(this.bot) || '?'})` };
+        }
+        const r = this.observePlayer(args[0]);
+        return r;
+      }
+      case 'jump': case 'test-jump': {
+        // Prove the movement stack works, on demand, without a fight or a goal.
+        const exit = M.bestExitDirection(this.bot, { hop: true });
+        M.hop(this.bot, 1);
+        return { ok: true, msg: `hopped (facing). exit candidate: ${exit ? `rise ${exit.rise} dir ${exit.dx},${exit.dz}` : 'none (flat or boxed in)'}` };
+      }
+      case 'climb': {
+        M.climbOut(this.bot, { timeoutMs: 3000, hop: true })
+          .then(res => this.log.info('actor: climb', { res }));
+        return { ok: true, msg: 'attempting to climb out' };
+      }
+      case 'ai': {
+        const mode = String(args[0] || 'assist').toLowerCase();
+        if (!['off', 'assist', 'force'].includes(mode)) return { ok: false, msg: 'usage: ai off|assist|force' };
+        this.cfg.ai = mode === 'off' ? 'off' : { ...(this.cfg.ai || {}), pvp: mode };
+        if (mode !== 'off' && !this.jev) this.jev = new JevClient({ logger: this.log, enabled: true, url: (this.cfg.ai || {}).url });
+        if (this.pvp) this.pvp.jev = this.jev;
+        if (this.pvp) this.pvp.ai = mode;
+        return { ok: true, msg: `ai advisor: ${mode}` };
+      }
+      case 'result': return this.pvpSummary();
+      case 'players': {
+        const bot = this.bot;
+        const list = Object.keys(bot.players || {}).filter(n => n !== bot.username);
+        return { ok: true, msg: list.length ? list.join('\n') : 'no other players visible', data: list };
+      }
       case 'help':
         return {
           ok: true,
           msg: 'commands: afk | hold | goto <x> [y] <z> | come | home [x y z] | ' +
                'follow <player> [range] | wander [radius] | gather [radius] | ' +
-               'attack <name> | pvp <player> [rookie|medium|hard|0..1] [stop|hp <n>] | ' +
-               'eat | survive on|off'
+               'attack <name> | pvp <player> [tier] [stop|hp <n>|result|ai <mode>] | ' +
+               'hearts [player] | players | jump | climb | ai off|assist|force | eat | survive on|off'
         };
       default:
         return { ok: false, msg: `unknown command: ${cmd} (try 'help')` };
@@ -1199,8 +1844,7 @@ const NEIGHBOURS = [
 // Reusable scratch vectors: mineflayer's world accessor requires a real Vec3
 // (it calls pos.floored()), and allocating one per probe would churn the GC
 // badly inside the renderers and the wood-gathering loop.
-const _scratch = new Vec3(0, 0, 0);
-function probe(x, y, z) { _scratch.x = x; _scratch.y = y; _scratch.z = z; return _scratch; }
+const probe = T.probe;
 
 function describeGoal(desc) {
   if (!desc) return null;
@@ -1251,50 +1895,14 @@ function currentGoal(bot) {
   return pf.goal != null ? pf.goal : null;
 }
 
-/** A safe place to stand while digging the block at `pos`: the nearest
- * adjacent column whose top is solid and two tall (head room). Prefers spots
- * at a similar height to the block so the bot does not have to climb. */
-function standableSpotNear(bot, pos) {
-  const x = pos.x, y = pos.y, z = pos.z;
-  let best = null, bestScore = Infinity;
-  for (const d of NEIGHBOURS) {
-    if (!d[1]) continue;                       // only horizontal neighbours
-    const nx = x + d[0], nz = z + d[2];
-    const top = topSolidY(bot, nx, nz, y);
-    if (top == null) continue;
-    // need head room above the standing surface
-    const head = safeBlockAt(bot, nx, top + 2, nz);
-    if (head && head.name !== 'air' && head.boundingBox !== 'empty') continue;
-    const score = Math.abs(top - y);
-    if (score < bestScore) { bestScore = score; best = { x: nx, y: top + 1, z: nz }; }
-  }
-  return best;
-}
+// standableSpotNear / safeBlockAt also come from terrain.js
+const standableSpotNear = T.standableSpotNear;
+const safeBlockAt = T.safeBlockAt;
 
-function safeBlockAt(bot, x, y, z) {
-  try { return bot.blockAt(probe(x, y, z)); } catch (_) { return null; }
-}
-
-function topSolidY(bot, x, z, refY) {
-  // Highest non-empty block near reference height. Null if the column is
-  // unloaded (mineflayer returns null for unloaded chunks).
-  x = Math.floor(x); z = Math.floor(z);
-  const world = bot.world;
-  if (!world) return null;
-  const base = Math.floor(refY == null ? 64 : refY);
-  let loaded = true;
-  try {
-    if (world.getColumnAt) loaded = !!world.getColumnAt(probe(x, 0, z));
-    else if (world.getBlock) loaded = world.getBlock(probe(x, 0, z)) != null;
-  } catch (_) { loaded = false; }
-  if (!loaded) return null;
-  for (let y = Math.min(320, base + 24); y >= Math.max(-64, base - 24); y--) {
-    let b = null;
-    try { b = bot.blockAt(probe(x, y, z)); } catch (_) { return null; }
-    if (b && b.name !== 'air' && b.boundingBox !== 'empty') return y;
-  }
-  return base;
-}
+// Terrain queries live in src/terrain.js so the actor and the PvP controller
+// cannot disagree about what "the ground" means. Re-exported here for callers
+// (tests, tools) that have always reached for them on the actor module.
+const topSolidY = T.topSolidY;
 
 function findEntityNamed(bot, name) {
   if (!name) return null;

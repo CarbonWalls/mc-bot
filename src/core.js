@@ -45,6 +45,10 @@ class BotCore {
     this.bot = null;
     this.actor = null;
     this.reconnectAttempts = 0;
+    // A kick that is a verdict about this client (ban), as opposed to a transient
+    // failure. Set from the kicked handler; scheduleReconnect refuses to proceed.
+    this.banFatal = false;
+    this.retryHoldMs = 0;
     this.reconnectTimer = null;
     this.watchdog = null;
     this.antiIdleTimer = null;
@@ -138,9 +142,34 @@ class BotCore {
    * connection (ported from the original src/bot.js)
    * ------------------------------------------------------------------ */
 
-  scheduleReconnect(reason) {
+  /**
+   * @param {string} reason
+   * @param {object} [opts] { waitIndefinitely } — set when the *proxy itself*
+   *   answered that the server is stopped. An AFK bot's job is to be there when
+   *   it wakes: Aternos sleeps an empty server in ~6 minutes, and if the daemon
+   *   gave up (and exited) after the maxAttempts budget, the thing that was
+   *   supposed to keep the server open would be gone and the server would stay
+   *   down. The give-up ceiling exists to stop hammering an address that will
+   *   never answer (the 694-connects bug), which is a DIFFERENT failure: a wrong
+   *   address produces no ping answer at all, while a sleeping one answers
+   *   "Offline" explicitly. Only the latter is exempt, and it still costs just
+   *   one status ping every maxDelayMs - no handshake, no login attempt.
+   */
+  scheduleReconnect(reason, opts = {}) {
     if (this.shuttingDown) return;
     if (this.versionFatal) return;   // unsupported protocol: retrying cannot help
+    if (this.banFatal) {
+      // A ban is a decision about this account/IP, not a transient failure.
+      // Retrying makes it worse, so stop and tell the operator what to do.
+      this.logger.error('not reconnecting: the server banned or rejected this client', {
+        reason,
+        kickReason: this.stats.lastKickReason,
+        hint: 'the ban must be lifted server-side; then `mc start` again'
+      });
+      this.stats.state = 'banned';
+      this.status({ willReconnect: false });
+      return;
+    }
     const cfg = this.cfg;
     if (!cfg.reconnect.enabled) {
       this.logger.warn('reconnect disabled, exiting', { reason });
@@ -148,10 +177,65 @@ class BotCore {
       return;
     }
     if (this.reconnectTimer) return;
+
+    /* A stopped server is a patient wait, not a retry to be counted: it goes
+     * before the attempt increment so waiting out an hour of sleep spends none
+     * of the give-up budget. The budget exists for a wrong address, which never
+     * answers a ping at all; a proxy that answers "Offline" has told us exactly
+     * what is wrong and that waiting is the correct action. */
+    if (opts.waitIndefinitely) {
+      // Do not count toward the give-up ceiling, and do not keep growing the
+      // delay without bound: one cheap status ping every maxDelayMs is patient,
+      // not abusive, and it is what keeps this box from hibernating forever.
+      this.stats.state = 'waiting_for_server';
+      const delay = Math.min(cfg.reconnect.maxDelayMs, cfg.reconnect.initialDelayMs * 4) +
+        Math.round(Math.random() * cfg.reconnect.jitterMs);
+      this.logger.info('server is stopped; waiting for it to start', {
+        delayMs: delay, attempt: this.reconnectAttempts,
+        note: 'an AFK bot that exited while the server slept could never wake it'
+      });
+      this.status({ willReconnect: true, nextReconnectInMs: delay });
+      this.reconnectTimer = setTimeout(() => {
+        this.reconnectTimer = null;
+        connect(this);
+      }, delay);
+      this.killTimers.add(this.reconnectTimer);
+      return;
+    }
+
     this.reconnectAttempts++;
+
+    /* Give up on a server that has never accepted us.
+     *
+     * The backoff caps at maxDelayMs, so a permanently wrong host/port or a
+     * server that rejects this client produces an endless cycle at the cap —
+     * observed as 694 connects in 24 hours against a dead address. Retrying is
+     * only rational if something might change; after `maxAttempts` spawns-worth
+     * of failure with no successful spawn in between, the most likely change is
+     * that the operator needs to fix the config. Stop loudly instead of
+     * hammering quietly, and say exactly what to check. */
+    const maxAttempts = cfg.reconnect.maxAttempts != null ? cfg.reconnect.maxAttempts : 25;
+    if (this.stats.spawns === 0 && this.reconnectAttempts > maxAttempts) {
+      this.logger.error('giving up: never spawned on this server, retrying will not change that', {
+        attempts: this.reconnectAttempts, target: `${cfg.host}:${cfg.port}`, reason,
+        hint: 'check host/port (Aternos regenerates *.aternos.host on restart), or run: mc doctor / python3 src/probe.py <host> <port>'
+      });
+      this.stats.state = 'giving_up';
+      this.status({ fatal: true, willReconnect: false });
+      if (cfg.reconnect.exitOnGiveUp !== false) setTimeout(() => this.shutdown('give-up'), 500);
+      return;
+    }
+
     const base = cfg.reconnect.initialDelayMs * Math.pow(cfg.reconnect.multiplier, this.reconnectAttempts - 1);
-    const delay = Math.min(cfg.reconnect.maxDelayMs, Math.round(base)) +
+    let delay = Math.min(cfg.reconnect.maxDelayMs, Math.round(base)) +
       Math.round(Math.random() * cfg.reconnect.jitterMs);
+    // A kick that said "come back later" (server full, whitelist queued) widens
+    // the wait once, and the value is consumed rather than kept, so the next
+    // ordinary blip is not permanently slowed by a transient one.
+    if (this.retryHoldMs) {
+      delay = Math.max(delay, this.retryHoldMs);
+      this.retryHoldMs = 0;
+    }
     this.logger.info('scheduling reconnect', { attempt: this.reconnectAttempts, delayMs: delay, reason });
     this.stats.state = 'waiting_to_reconnect';
     this.status({ willReconnect: true, nextReconnectInMs: delay });
@@ -257,10 +341,16 @@ class BotCore {
    * Without this the bot reconnect-loops forever against an unjoinable server
    * (which is what gets an empty Aternos box hibernated). Returns true when the
    * error is unrecoverable and reconnecting should stop.
+   *
+   * The wording matters. mineflayer says "Unsupported protocol version '-1'" —
+   * which does NOT contain the phrase "not supported", so the original pattern
+   * missed it. The consequence was observed directly: a daemon hammered a dead
+   * address for 24 hours and logged 694 connects, which is precisely the
+   * reconnect-loop this guard exists to prevent. Match the real string.
    */
   isVersionUnsupported(err) {
     const msg = err && err.message ? err.message : String(err);
-    return /No data available for version|not supported|is not supported/i.test(msg);
+    return /no data available for version|not supported|is not supported|unsupported protocol|unsupported version|protocol version/i.test(msg);
   }
 
   onConnected(bot) {
@@ -282,6 +372,10 @@ class BotCore {
       const first = this.stats.spawns === 0;
       this.stats.spawns++;
       this.reconnectAttempts = 0;
+    // A kick that is a verdict about this client (ban), as opposed to a transient
+    // failure. Set from the kicked handler; scheduleReconnect refuses to proceed.
+    this.banFatal = false;
+    this.retryHoldMs = 0;
       this.stats.state = 'spawned';
       this.stats.lastSpawnAt = new Date().toISOString();
       this.stopWatchdog();
@@ -298,6 +392,10 @@ class BotCore {
       });
 
       // (re)attach the behaviour engine to this connection
+      // A successful spawn is proof the ban/verdict no longer applies: an IP ban
+      // that has expired, or a whitelist that was opened. Clear the flag so the
+      // daemon can resume normal operation without a restart.
+      this.banFatal = false;
       if (this.actor) {
         this.actor.attach(bot);
       } else {
@@ -320,9 +418,35 @@ class BotCore {
     bot.on('kicked', (reason) => {
       this.stats.kicks++;
       this.stats.lastKickReason = typeof reason === 'string' ? reason : JSON.stringify(reason);
-      this.logger.warn('kicked by server', { reason: this.stats.lastKickReason });
-      this.status();
-      this.broadcast('kicked', { reason: this.stats.lastKickReason });
+      const kind = classifyKick(this.stats.lastKickReason);
+      // Persisted on stats, not just pushed into the status file: snapshot()
+      // reads stats.kickKind for `mc status`, and this handler runs before the
+      // next spawn clears state, so this is the only place it can be captured.
+      this.stats.kickKind = kind.kind;
+      this.logger.warn('kicked by server', {
+        reason: this.stats.lastKickReason, kind,
+        action: kind.action
+      });
+      // Some kicks are verdicts about US, not about the moment. Reconnecting
+      // into a ban is not persistence, it is harassment, and it is how a
+      // temporary block becomes a permanent one. Observed live: a server
+      // answered four consecutive connects with
+      //   {"translate":"multiplayer.disconnect.banned.reason",
+      //    "with":["You have been idle for too long. This violates our terms of service"]}
+      // and the daemon happily retried on its backoff schedule, 25 times, then
+      // would have retried forever against a second server.
+      if (kind.stop) {
+        this.banFatal = true;
+        this.stats.state = 'banned';
+        this.status({ fatal: true, willReconnect: false, kickKind: kind.kind });
+        return;
+      }
+      // "Server full" / "whitelist" are worth waiting out, but not at the fast
+      // end of the backoff: a 20-slot server that is momentarily packed will
+      // still be packed in six seconds. Widen the next attempt.
+      if (kind.holdMs) this.retryHoldMs = Math.max(this.retryHoldMs || 0, kind.holdMs);
+      this.status({ kickKind: kind.kind });
+      this.broadcast('kicked', { reason: this.stats.lastKickReason, kind: kind.kind });
     });
 
     bot.on('error', (err) => {
@@ -412,6 +536,18 @@ class BotCore {
       case 'exec':
         this.requireSpawn();
         return this.actor.exec(args.line);
+      case 'observe': {
+        // Observed facts about another player: gamemode and any real health
+        // signal. Answers "can I even hit them?" without guessing.
+        this.requireSpawn();
+        return this.actor.observePlayer(args.name || args.player);
+      }
+      case 'pvp-result':
+        if (!this.actor || !this.actor.pvp) throw new Error('no pvp fight recorded');
+        return this.actor.pvp.summary();
+      case 'world':
+        this.requireSpawn();
+        return { ground: this.actor.info.ground, terrain: this.actor._groundFacts() };
       case 'survive':
         this.requireSpawn();
         // No argument => toggle. (An explicit value is honoured either way.)
@@ -493,6 +629,12 @@ class BotCore {
     return {
       pid: process.pid,
       state: this.stats.state,
+      // Whether the daemon is on the offline generated world. Callers need this
+      // to avoid giving live-server advice to a demo run (an idle-ban warning on
+      // a server that cannot ban anything is noise that trains people to ignore
+      // the real ones), and the TUI shows DEMO so nobody mistakes a demo duel
+      // for a live one.
+      demo: !!this.demo,
       target: `${this.cfg.host}:${this.cfg.port}`,
       username: this.cfg.username,
       version: this.cfg.version,
@@ -508,13 +650,34 @@ class BotCore {
       lastSpawnAt: this.stats.lastSpawnAt,
       lastDisconnectAt: this.stats.lastDisconnectAt,
       lastKickReason: this.stats.lastKickReason,
+      // Why the daemon is sitting idle. A ban is invisible unless it is stated:
+      // the process is alive, the socket answers, and nothing moves — which reads
+      // to an operator as "the bot is broken" rather than "the server refused it".
+      kickKind: this.stats.kickKind || null,
+      banned: !!this.banFatal,
       lastError: this.stats.lastError,
       reconnectAttempts: this.reconnectAttempts,
       health: bot && bot.health != null ? bot.health : null,
+      // Hearts, the way the game shows them, plus where the number came from.
+      hearts: bot && bot.health != null ? Math.max(0, Math.ceil(bot.health / 2)) : null,
+      gamemode: bot && bot.game ? bot.game.gameMode : null,
+      damage: this.actor && this.actor.tracker ? {
+        // What the server actually reported, never inferred. This is the panel
+        // that answers "did I hit them / are they even damageable?".
+        incomingDamage: this.actor.tracker.lastIncomingDamage != null
+          ? +this.actor.tracker.lastIncomingDamage.toFixed(1) : null,
+        lastHurtAgoMs: this.actor.tracker.lastHurtAt ? Date.now() - this.actor.tracker.lastHurtAt : null,
+        myHearts: this.actor.tracker.myVitals.hearts
+      } : null,
       food: bot && bot.food != null ? bot.food : null,
       dimension: bot && bot.game ? bot.game.dimension : null,
       mode: this.actor ? this.actor.mode : (this.cfg.behaviors && this.cfg.behaviors.mode) || 'afk',
-      survive: this.actor ? !!this.actor.survive : !!(this.cfg.survive && this.cfg.survive.enabled),
+      // Behaviours live under cfg.behaviors; reading cfg.survive here reported
+      // "off" for a config that had explicitly enabled the survival layer, which
+      // matters most before the actor attaches on the first spawn.
+      survive: this.actor ? !!this.actor.survive
+        : !!((this.cfg.behaviors && this.cfg.behaviors.survive || this.cfg.survive) &&
+             ((this.cfg.behaviors && this.cfg.behaviors.survive) || this.cfg.survive).enabled),
       goal: this.actor && this.actor.goalDesc ? this.actor.goalDesc : null,
       home: this.actor && this.actor.home ? this.actor.home : null,
       pos: bot && bot.entity ? roundPos(bot.entity.position) : null,
@@ -794,11 +957,138 @@ function freshStats() {
     state: 'starting',
     connects: 0, spawns: 0, disconnects: 0, kicks: 0, errors: 0,
     lastSpawnAt: null, lastDisconnectAt: null, lastError: null, lastKickReason: null,
+    kickKind: null,
     uptimeSeconds: 0
   };
 }
 
 function clearTimer(t) { if (t) clearTimeout(t); return null; }
+
+/**
+ * Decide what to do with a status-ping version block, as ONE pure function.
+ *
+ * This used to be inlined in connect(), which made the two most consequential
+ * branches in the daemon reachable only by running a socket against a live
+ * server - i.e. untestable, and they were untested. Both had bugs of exactly
+ * that kind:
+ *
+ *   1. "Stopped server" is NOT "unsupported version". While betahhd was asleep,
+ *      its Aternos proxy answered the ping with
+ *          { name: "\u00a7c\u25cf Offline", protocol: -1 }
+ *      and -1 is not a Minecraft version at all - it is the value a *client*
+ *      sends in the status handshake to mean "just give me the MOTD". The
+ *      README documents that this placeholder means "the server is stopped", and
+ *      the code contradicted the README: -1 fell through serverVersionKnown(),
+ *      came back !ok, and the daemon marked the whole run fatal and quit. An
+ *      Aternos box sleeps when nobody joins (here, ~6 minutes), so "stopped" is
+ *      the normal state to ride out, not a verdict. This was observed live.
+ *   2. The reverse error is equally fatal in the other direction: treating a
+ *      genuinely unsupported version as transient is what produces a
+ *      reconnect loop against an unjoinable server (694 connects in 24 hours).
+ *
+ * So: a real, positive protocol number we have no data for is `unsupported` and
+ * stops the bot; anything that cannot be a version is `stopped` and waits.
+ *
+ * @param {object} version             { name, protocol } from the status ping
+ * @param {function} versionKnown      protocol -> {ok, as}
+ * @returns {kind:'connect'|'stopped'|'unsupported', ...diagnostics}
+ */
+function decideProbeAction(version, versionKnown) {
+  const versionName = version && version.name;
+  const protocol = version && version.protocol;
+  const isRealProtocol = typeof protocol === 'number' && Number.isFinite(protocol) &&
+    Number.isInteger(protocol) && protocol > 0;
+  if (!isRealProtocol) {
+    return {
+      kind: 'stopped',
+      versionName, protocol,
+      probeDecision: { name: versionName, protocol, ok: false, stopped: true },
+      hint: 'Aternos proxies answer with "\u25cf Offline" / a negative protocol while the server is asleep; waiting for it to start'
+    };
+  }
+  const known = versionKnown(String(protocol));
+  const log = { version: versionName, protocol, supported: known.ok, knownAs: known.as };
+  if (!known.ok) {
+    return {
+      kind: 'unsupported',
+      versionName, protocol, log,
+      probeDecision: { name: versionName, protocol, ok: false },
+      lastError: `server version ${versionName} (protocol ${protocol}) not supported`,
+      hint: 'update minecraft-data to a release that includes this protocol, then restart'
+    };
+  }
+  return {
+    kind: 'connect',
+    versionName, protocol, log,
+    probeDecision: { name: versionName, protocol, ok: true, as: known.as }
+  };
+}
+
+/**
+ * Classify a kick reason into what the daemon should DO about it.
+ *
+ * The original code treated every kick identically: log it, and let the normal
+ * reconnect path try again. That is right for a lag blip or a server restart and
+ * catastrophically wrong for a ban, because reconnecting into a ban is how a
+ * temporary block turns permanent. The categories, and why:
+ *
+ *   ban        - "banned", "permanently banned", "unverified reply", "ip ban".
+ *                A verdict about this client. Stop entirely; retrying is hostile.
+ *   idle_ban   - Aternos' "You have been idle for too long" TOoS kick (observed
+ *                live). This is a ban too, but it is caused by the bot's own
+ *                behaviour, so the message says which knob to turn.
+ *   denied     - whitelist / server full / "you are not permitted": transient,
+ *                wait longer rather than stop.
+ *   transient  - everything else (restart, kicked-for-nothing, keepalive), retry
+ *                on the normal schedule.
+ *
+ * Matching is on the translated string because mineflayer hands kicked() either
+ * a raw string or a JSON chat component with `translate`/`with`, and Aternos and
+ * Paper use different wordings for the same outcome.
+ */
+function classifyKick(reason) {
+  const raw = String(reason == null ? '' : reason);
+  // Match the translated text too: mineflayer hands kicked() either a raw string
+  // or a JSON chat component whose `translate` key is a locale CODE
+  // (multiplayer.disconnect.banned.invalid_reply), and the operator-facing
+  // English may not be in the payload at all. Matching only prose is how
+  // server_full fell through to "unknown" in a live test of this function.
+  let text = raw.toLowerCase();
+  try {
+    const j = JSON.parse(raw);
+    if (j && typeof j === 'object') {
+      const bits = [j.translate, j.text, ...(Array.isArray(j.with) ? j.with : []),
+                    ...(Array.isArray(j.extra) ? j.extra.map(e => (e && (e.text || e.translate)) || '') : [])];
+      text = (text + ' ' + bits.filter(Boolean).join(' ')).toLowerCase();
+    }
+  } catch (_) { /* not JSON: match on the raw string */ }
+  const has = (...ws) => ws.some(w => text.includes(w));
+  if (has('idle for too long', 'idle too long', 'violates our terms', 'terms of service')) {
+    return {
+      kind: 'idle_ban', stop: true, holdMs: 0,
+      action: 'stop: the server bans idle clients - enable antiIdle.movement or run an active mode, then start again',
+      hint: 'mc start will hold position; `mc wander 32` or config antiIdle.movement=true keeps the server awake'
+    };
+  }
+  if (has('disconnect.banned', 'banned', 'permanently banned', 'blacklisted',
+          'invalid_reply', 'unverified reply', 'ip ban', 'you are banned')) {
+    return { kind: 'ban', stop: true, holdMs: 0, action: 'stop: reconnecting into a ban makes it permanent', hint: 'the ban must be lifted server-side' };
+  }
+  if (has('whitelist', 'white_list', 'not permitted', 'server_full', 'server is full',
+          'is full', 'try later', 'server white list', 'connection denied', 'rejected')) {
+    return { kind: 'denied', stop: false, holdMs: 60000, action: 'wait 60s+ before the next attempt' };
+  }
+  // logged_in_new is NOT a ban: it means a second session took this username,
+  // which happens constantly when a daemon reconnects before its old session has
+  // timed out. Stopping on it would turn a normal blip into a dead bot.
+  if (has('kicked for no reason', 'keepalive', 'timed out', 'timeout',
+          'logged_in_new', 'logged in from another location', 'too many logins', 'server closed',
+          'disconnect.generic', 'outdated_client', 'outdated_server',
+          'protocol_mismatch', 'invalid_host', 'redesigned', 'reconnect')) {
+    return { kind: 'transient', stop: false, holdMs: 0, action: 'retry on the normal backoff' };
+  }
+  return { kind: 'unknown', stop: false, holdMs: 0, action: 'retry on the normal backoff' };
+}
 
 function resolvePath(p) {
   if (!p) return p;
@@ -854,27 +1144,38 @@ function connect(core) {
         doConnect(core);
         return;
       }
-      const proto = version.protocol;
-      const known = serverVersionKnown(String(proto));
-      core.logger.info('server ping', {
-        version: version.name, protocol: proto,
-        supported: known.ok, knownAs: known.as
-      });
-      core._probeDecision = { name: version.name, protocol: proto, ok: known.ok };
-      if (!known.ok) {
+      const decision = decideProbeAction(version, serverVersionKnown);
+      core._probeDecision = decision.probeDecision;
+      if (decision.kind === 'stopped') {
+        // Log-and-wait, never fatal: see decideProbeAction for why.
+        core.logger.warn('server ping returned a non-version protocol (server likely stopped)', {
+          version: decision.versionName, protocol: decision.protocol,
+          hint: decision.hint
+        });
+        core.stats.state = 'waiting_for_server';
+        core.status({ willReconnect: true });
+        // Do NOT connect (the handshake would fail) and do NOT mark it fatal.
+        // scheduleReconnect owns the wait, with the same backoff as any blip.
+        core.scheduleReconnect('server is stopped (ping protocol ' + decision.protocol + ')',
+          { waitIndefinitely: true });
+        return;
+      }
+      if (decision.kind === 'unsupported') {
+        core.logger.info('server ping', decision.log);
         core.logger.error(
           'server runs a Minecraft version the installed minecraft-data cannot serve', {
-            serverVersion: version.name,
-            protocol: proto,
+            serverVersion: decision.versionName,
+            protocol: decision.protocol,
             minecraftDataVersion: require('minecraft-data/package.json').version,
-            hint: 'update minecraft-data to a release that includes this protocol, then restart'
+            hint: decision.hint
           });
         core.stats.state = 'unsupported_version';
-        core.stats.lastError = `server version ${version.name} (protocol ${proto}) not supported`;
+        core.stats.lastError = decision.lastError;
         core.versionFatal = true;
         core.status({ fatal: true });
         return;
       }
+      core.logger.info('server ping', decision.log);
       doConnect(core);
     }).catch((err) => {
       // A ping failure is not a verdict — the server may just be starting. Let
@@ -973,9 +1274,31 @@ function doConnect(core) {
 }
 
 /**
- * Pre-flight: ping the server (as the Java status handshake already does in
- * src/probe.py) so the daemon can report the server's real Minecraft version
- * up front. Returns null if the ping fails.
+ * Pre-flight: ping the server (the same status/handshake src/probe.py does) so
+ * the daemon can report the server's real Minecraft version up front, and refuse
+ * to reconnect-loop against a version the installed minecraft-data cannot speak.
+ * Returns null if the ping fails.
+ *
+ * THE BUG THAT MADE THIS PROBE ALWAYS RETURN NULL
+ * -----------------------------------------------
+ * The JSON payload's length was read as a SINGLE BYTE:
+ *
+ *     const jsonLen = payload[1];        // 0x00 id, then varint string length
+ *
+ * but it is a **varint**, which the server encodes in two bytes as soon as the
+ * status JSON exceeds 127 bytes - which every real server's does. On the captured
+ * response from 4of5.aternos.me the length is 1675, encoded `8b 0d`; the single
+ * byte read `0x8b` = 139, so the slice was truncated mid-string, JSON.parse threw,
+ * and probeServer resolved null. The consequence is not a cosmetic log gap: this
+ * function is documented as "the SOLE arbiter of unsupported version", so when it
+ * fails the daemon falls through to the raw handshake, and the version gate that
+ * exists to prevent reconnect-looping never runs. That is precisely how a previous
+ * daemon managed 694 connects against a dead address in 24 hours.
+ *
+ * The fix reads every length as a real varint and parses the JSON on a byte
+ * boundary, with a regression test pinned to the captured bytes
+ * (tests/fixtures/status_response_4of5.bin) so a future refactor cannot silently
+ * reintroduce the single-byte read.
  */
 function probeServer(host, port, timeoutMs = 8000) {
   return new Promise((resolve) => {
@@ -1002,30 +1325,90 @@ function probeServer(host, port, timeoutMs = 8000) {
       let buf = Buffer.alloc(0);
       socket.on('data', (d) => {
         buf = Buffer.concat([buf, d]);
-        // read until we have the full JSON response
-        if (buf.length < 4) return;
-        // packet length is a varint; assume it fits in 3 bytes for status
-        let vi = 0, vl = 0;
-        for (let i = 0; i < 3; i++) {
-          const b = buf[i]; vl += (b & 0x7F) << (7 * i);
-          if (!(b & 0x80)) { vi = i + 1; break; }
+        // Never buffer an unbounded response from a hostile or confused endpoint.
+        if (buf.length > MAX_STATUS_BYTES + 16) {
+          clearTimeout(timer); socket.destroy(); done(null); return;
         }
-        if (!vi) return;
-        const payload = buf.slice(vi);
-        if (payload.length < 2) return;
-        const jsonLen = payload[1];        // 0x00 id, then varint string length
-        if (payload.length < 2 + jsonLen) return;
-        try {
-          const json = JSON.parse(payload.slice(2, 2 + jsonLen).toString('utf8'));
-          clearTimeout(timer); socket.destroy();
-          done(json && json.version ? json.version : null);
-        } catch (_) {
-          clearTimeout(timer); socket.destroy(); done(null);
-        }
+        const parsed = parseStatusPacket(buf);
+        // A short MOTD can fit in one TCP segment; a full status JSON often does
+        // not, so keep waiting until the declared length has arrived.
+        if (parsed === 'need-more') return;
+        clearTimeout(timer);
+        socket.destroy();
+        done(parsed && parsed.version ? parsed.version : null);
       });
     } catch (_) { done(null); }
   });
 }
+
+/**
+ * Read one protocol varint from buf at `offset`.
+ * @returns {{value:number, next:number}|null} null when more bytes are needed.
+ */
+const MAX_STATUS_BYTES = 1024 * 1024;   // a status JSON is a few KB; 1 MB is generous
+
+/**
+ * Read one protocol varint (up to 5 bytes / 32 bits, per the Java edition spec).
+ * @returns {{value:number, next:number}|null} null when more bytes are needed.
+ *
+ * Two things this gets right that are easy to get wrong, both found by testing
+ * the boundaries rather than a happy path:
+ *
+ *   1. ORDER. The terminating-byte check must come BEFORE the shift overflow
+ *      guard, or a legitimate 5-byte varint (`80 80 80 80 01` = 268,435,456) is
+ *      rejected: by the time the last byte is read the shift counter is already
+ *      past the limit, even though that byte ends the number.
+ *   2. RANGE. Accumulating in float64 (not int32 ops) means a value that
+ *      overflows 32 bits is detected as out of range and reported NaN instead of
+ *      being silently masked down. `80*4 + 7f` is 34,091,302,912 - not a legal
+ *      protocol varint - and masking it to 4,026,531,840 would hand a hostile
+ *      length back to the caller looking legitimate. (The caller's size bound
+ *      would catch it either way; that is defence in depth, not the fix.)
+ */
+function readVarint(buf, offset) {
+  let value = 0, shift = 0, i = offset;
+  for (; i < buf.length; i++) {
+    const b = buf[i];
+    value += (b & 0x7F) * Math.pow(2, shift);
+    if (!(b & 0x80)) {
+      if (value > 0xFFFFFFFF) return { value: NaN, next: i + 1 };   // out of protocol range
+      return { value: value >>> 0, next: i + 1 };
+    }
+    shift += 7;
+    if (shift > 28) return { value: NaN, next: i + 1 };             // past 5 bytes
+  }
+  return null;                                            // need more bytes
+}
+
+/**
+ * Decode a status-response packet: [packet length varint][packet id varint]
+ * [JSON length varint][JSON]. Returns the parsed object, the string 'need-more'
+ * while the buffer is incomplete, or null when the bytes are not a status packet.
+ *
+ * Exported for tests, because the bug this function exists to prevent was only
+ * visible against a real server's bytes, and CI must not need a live server.
+ */
+function parseStatusPacket(buf) {
+  if (buf.length < 2) return 'need-more';
+  const pkt = readVarint(buf, 0);
+  if (!pkt) return 'need-more';
+  if (!Number.isFinite(pkt.value) || pkt.value <= 0) return null;
+  // A status payload is a few KB; anything claiming megabytes is garbage or a
+  // deliberately huge varint, and waiting for it would hang the probe open.
+  if (pkt.value > MAX_STATUS_BYTES) return null;
+  if (buf.length < pkt.next + pkt.value) return 'need-more';
+  const body = buf.slice(pkt.next, pkt.next + pkt.value);
+  const id = readVarint(body, 0);
+  if (!id) return null;
+  const len = readVarint(body, id.next);
+  if (!len || !Number.isFinite(len.value)) return null;
+  if (len.value > MAX_STATUS_BYTES) return null;
+  if (len.value === 0) return null;
+  const json = body.slice(len.next, len.next + len.value);
+  if (json.length < len.value) return null;
+  try { return JSON.parse(json.toString('utf8')); } catch (_) { return null; }
+}
+
 
 function varint(n) {
   const bytes = [];
@@ -1063,4 +1446,4 @@ function startTimers(core) {
   core.killTimers.add(core.tickTimer);
 }
 
-module.exports = { BotCore, probeServer, serverVersionKnown };
+module.exports = { BotCore, probeServer, serverVersionKnown, parseStatusPacket, readVarint, classifyKick, decideProbeAction, MAX_STATUS_BYTES };
