@@ -165,38 +165,6 @@ function dropInDirection(bot, from, dx, dz, maxDepth = 4) {
 }
 
 /**
- * Cost of stepping from `a` (standing cell) onto column `b`.
- * Higher is worse; Infinity means "do not walk there".
- * Used by the ring-following escape planner to prefer a safe detour over a
- * shortcut through the air.
- */
-function stepCost(bot, a, b, maxDrop = 1) {
-  if (!a || !b) return Infinity;
-  const dy = b.y - a.y;
-  if (dy > 1) return Infinity;                       // a wall we are not climbing
-  const drop = a.y - b.y;
-  if (drop > maxDrop) {
-    // A real drop: confirm with the world, because b.y is a best guess.
-    const real = dropInDirection(bot, a, Math.sign(b.x - a.x), Math.sign(b.z - a.z), 4);
-    if (real > maxDrop) return Infinity;
-  }
-  let cost = Math.abs(dy) * 2;
-  if (drop > 0) cost += drop * 3;
-  if (b.headBlocked) cost += 5;
-  if (HALF_BLOCKS.has(b.block)) cost += 1;
-  return cost;
-}
-
-/** True when the cell in front of the bot is a step the bot should jump, not a wall. */
-function isClimbStep(bot, pos, dx, dz) {
-  const x = Math.floor(pos.x) + dx, z = Math.floor(pos.z) + dz;
-  const top = topSolidY(bot, x, z, pos.y);
-  if (top == null) return false;
-  const rise = top - Math.floor(pos.y);
-  return rise === 1 || rise === 0 && !isSolidBlock(safeBlockAt(bot, x, Math.floor(pos.y), z));
-}
-
-/**
  * The best nearby cell to retreat *to*, given a threat position.
  *
  * Replaces the old escape math, which computed

@@ -153,6 +153,39 @@ function register({ test, testAsync }) {
       `escapeSpot mutated the caller's position vector: ${bot.entity.position} != ${pristine}`);
   });
 
+  /* ---------------- gather/chop goes through the same terrain code -------- */
+  test('chopTree resolves its stand spot through terrain.js (no dead aliases)', async () => {
+    // Why this exists: the actor used to keep local aliases of the terrain
+    // helpers; when they were dropped during a refactor, `chopTree`'s stand-spot
+    // lookup started throwing ReferenceError — and all 224 offline tests stayed
+    // green, because none of them ever entered the chop loop (which needs
+    // mode='gather' AND a real log in a mock world, not an arena). A live server
+    // would have been the next to find out. So the test pins the wiring: the BFS
+    // must call terrain's standableSpotNear and resolve, not throw.
+    const world = MockWorld.arena({ floorY: FLOOR, radius: 30 });
+    world.set(2, FLOOR + 1, 0, 'oak_log');
+    world.set(2, FLOOR + 2, 0, 'oak_log');
+    const bot = new MockBot(world, { username: 'Tester', manualTicks: true });
+    bot._spawn();
+    bot.entity.position.set(4.5, FLOOR + 1, 0.5);
+    const T2 = require(path.join(SRC, 'terrain.js'));
+    let standCalls = 0;
+    const orig = T2.standableSpotNear;
+    T2.standableSpotNear = function (...args) { standCalls++; return orig.apply(T2, args); };
+    const actor = new (require(path.join(SRC, 'actor.js')).Actor)(bot, {
+      config: { canDig: true, gather: { approachMs: 1500 } }
+    });
+    actor.mode = 'gather';
+    try {
+      await actor.chopTree({ x: 2, y: FLOOR + 1, z: 0 });   // must not throw
+      assert.ok(standCalls >= 1,
+        'the chop loop must resolve its stand spot via terrain (0 calls = branch not covered)');
+    } finally {
+      T2.standableSpotNear = orig;
+      actor.destroy();
+    }
+  });
+
   /* ---------------- movement: the jump fix ---------------- */
   test('forward alone is stopped by a one-block step (the original bug, reproduced)', () => {
     const { bot } = arena({ stepAtZ: 6 });

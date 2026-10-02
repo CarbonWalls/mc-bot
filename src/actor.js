@@ -1016,7 +1016,7 @@ class Actor {
       // often inside the trunk; GoalNear on a *standing spot beside* the log
       // reliably stops the bot within dig reach instead. Targeting the trunk
       // itself makes pathfinder route into pits/branches it cannot escape.
-      const stand = standableSpotNear(bot, block.position);
+      const stand = T.standableSpotNear(bot, block.position);
       this.goalDesc = {
         type: 'near',
         x: stand ? stand.x : block.position.x,
@@ -1889,19 +1889,10 @@ function isPathingNow(bot) {
          (typeof pf.isBuilding === 'function' && pf.isBuilding());
 }
 
-function currentGoal(bot) {
-  const pf = bot && bot.pathfinder;
-  if (!pf) return null;
-  return pf.goal != null ? pf.goal : null;
-}
-
-// standableSpotNear / safeBlockAt also come from terrain.js
-const standableSpotNear = T.standableSpotNear;
-const safeBlockAt = T.safeBlockAt;
-
 // Terrain queries live in src/terrain.js so the actor and the PvP controller
-// cannot disagree about what "the ground" means. Re-exported here for callers
-// (tests, tools) that have always reached for them on the actor module.
+// cannot disagree about what "the ground" means. This alias is kept because the
+// module's own code reaches for topSolidY constantly; everything else goes
+// through T.* directly.
 const topSolidY = T.topSolidY;
 
 function findEntityNamed(bot, name) {
@@ -1977,6 +1968,6 @@ function inventoryFullOfLogs(bot) {
 }
 
 module.exports = {
-  Actor, VALID_MODES, describeGoal, isPathingNow, currentGoal,
+  Actor, VALID_MODES, describeGoal, isPathingNow,
   isNight, nearestHostile, countHostiles
 };
