@@ -1,0 +1,26 @@
+# Live survival duel — BLOCKED (needs a human in survival)
+# checked 2026-10-03T10:12:01Z on betahhd.aternos.me:49851 (Paper 1.21.11/774)
+
+## Why the win/loss verdict path cannot run
+The only other entity on this server is the human, and they are in CREATIVE.
+The bot's own rule (src/perceive.js, src/pvp.js) is that an unkillable opponent
+is 'no-fight' — verified live in the previous session. A win/loss verdict with
+confirmedHits > 0 requires the opponent to be in survival.
+
+## Evidence
+  ENC_7376484R
+  ENC_7376484R: gamemode creative, health 20 (estimated), hearts 10
+
+## Not attempted against a mob as a substitute
+That is the mob-kill item, verified separately in results/live_mob_kill.txt.
+
+## Live run of the reachable half, 2026-10-03T10:12:32Z
+  mc pvp ENC_7376484R hard  ->  no-fight — opponent is in creative mode and cannot
+    be damaged (swings 0, confirmed 0; opponent 10 hearts, creative)
+  Daemon log:
+    2026-10-03T10:12:17.552Z INFO  pvp: engaging target=ENC_7376484R tier=1 retreatHp=6 ai=off opponentGamemode=creative
+    2026-10-03T10:12:17.554Z INFO  pvp: stopped reason=opponent is in creative mode and cannot be damaged result=no-fight hits=0 confirmedHits=0 estHealth=20 hearts=10 enemyHpOnUs=0
+
+  So the duel stack runs, tracks the opponent and returns a verdict on this
+  server right now — it is specifically the win/loss branch that needs the
+  human in survival.

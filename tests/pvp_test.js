@@ -383,6 +383,53 @@ function register({ test, testAsync }) {
       assert.ok(r.ok && r.data.result === 'win');
       actor.destroy();
     });
+
+    // A MOB kill takes the other path to the same verdict, and used to take none:
+    // `attack <mob>` set mode and target by hand (skipping tracker.setTarget), the
+    // fight loop exited silently, and `result` reported the PREVIOUS duel — so a
+    // real kill was indistinguishable from losing the target. Live-verified on
+    // Paper 1.21.11 (swings 17, confirmedHits 16, result 'win'), pinned here.
+    //
+    // No events are emitted by hand: the mock's attack() produces the real packet
+    // signals (entityHurt, then entityDead at 0 hp), so the win has to be derived
+    // from the same perception path the live server exercises.
+    const { bot: b2, actor: a2 } = makePvp();
+    const zid = 9001;
+    b2.entities[zid] = {
+      id: zid, name: 'zombie', displayName: 'Zombie', username: 'zombie',
+      kind: 'Hostile mobs', isValid: true, health: 20,
+      position: b2.entity.position.offset(1, 0, 0)
+    };
+    const order = a2.exec('attack zombie');
+    assert.ok(order.ok, `attack must accept a mob name: ${order.msg}`);
+    await waitFor(() => !!a2.lastFight, 8000).then(() => {
+      const f = a2.lastFight;
+      assert.ok(f, 'a mob kill must leave a verdict behind');
+      assert.strictEqual(f.result, 'win', `entityDead is the only thing that calls a mob kill a win, got ${f.result}`);
+      assert.strictEqual(f.reason, 'opponent died');
+      assert.strictEqual(f.target, 'zombie');
+      assert.ok(f.swings >= 1 && f.confirmedHits >= 1,
+        `the win must carry its evidence, got swings ${f.swings}, confirmed ${f.confirmedHits}`);
+      const r = a2.exec('result');
+      assert.ok(r.ok && r.data.result === 'win', 'mc result must report the mob kill, not a stale duel');
+      assert.strictEqual(r.data.kind, 'mob-fight');
+      a2.destroy();
+    });
+
+    // The trap that made this unshippable the first time: restoring
+    // prevMode='attack' from the fight loop re-enters _beginFight forever
+    // (RangeError: Maximum call stack size exceeded, observed live, ~1000 engages
+    // in one millisecond). Combat modes must never be the mode restored to.
+    const { actor: a3 } = makePvp();
+    a3.prevMode = 'attack';
+    a3.mode = 'attack';
+    a3._restoreAfterCombat();
+    assert.strictEqual(a3.mode, 'afk', `a transient combat mode must restore to afk, got ${a3.mode}`);
+    a3.prevMode = 'gather';
+    a3.mode = 'fight';
+    a3._restoreAfterCombat();
+    assert.strictEqual(a3.mode, 'gather', 'a real goal (gather) must still be resumed');
+    a3.destroy();
   });
 
   test('pvp counts swings separately from confirmed hits', async () => {

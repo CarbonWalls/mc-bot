@@ -405,7 +405,9 @@ class Actor {
   /** Start a flee: set the mode, aim at reachable ground, and run the loop. */
   _beginFlee(threat, why) {
     const bot = this.bot;
-    this.prevMode = (this.mode === 'afk' || this.mode === 'hold') ? 'afk' : this.mode;
+    const cur = this.mode;
+    const transient = cur === 'fight' || cur === 'attack' || cur === 'kill' || cur === 'pvp';
+    this.prevMode = (cur === 'afk' || cur === 'hold' || transient) ? 'afk' : cur;
     this._preGoalMode = this.prevMode;
     this.mode = 'flee';
     this.stuckAttempts = 0;
@@ -505,7 +507,12 @@ class Actor {
    */
   _beginFight(target, why) {
     const bot = this.bot;
-    this.prevMode = (this.mode === 'afk' || this.mode === 'hold') ? (this.prevMode || 'afk') : this.mode;
+    // Do not record a combat mode as the thing to restore to. 'attack' is how an
+    // operator's order arrives and 'fight' is our own state; either one restored
+    // later re-arms this same loop from its own exit (live stack overflow).
+    const cur = this.mode;
+    const transient = cur === 'fight' || cur === 'attack' || cur === 'kill' || cur === 'pvp';
+    this.prevMode = (cur === 'afk' || cur === 'hold' || transient) ? (transient ? 'afk' : (this.prevMode || 'afk')) : cur;
     this._preGoalMode = this.prevMode;
     this.mode = 'fight';
     this.stuckAttempts = 0;
@@ -514,6 +521,11 @@ class Actor {
     this._fightStartedAt = Date.now();
     this._lastFightStep = 0;
     this.hitCount = (this.hitCount || 0) + 1;
+    // Fresh verdict record per engagement. A mob kill had no outcome of its own:
+    // fightLoop() returned silently, so `mc result` reported the *previous duel*
+    // and a real kill was indistinguishable from losing the target.
+    this._fightVitals = this.tracker && target && target.id != null ? this.tracker.of(target) : null;
+    this.lastFight = null;
     if (this.tracker && target && target.id != null) this.tracker.setTarget(target);
     this.log.info('actor: engaging', { why: why || 'order', mob: target && (target.username || target.name || target.displayName) });
     this.fightLoop().catch(e => this.log.debug('fight loop ended', { error: e.message }));
@@ -647,7 +659,13 @@ class Actor {
    * spelling exists.
    */
   pvpSummary() {
-    if (!this.pvp) return { ok: false, msg: 'no pvp fight recorded yet' };
+    if (!this.pvp) {
+      // No duel has run, but a mob fight may have. Report that verdict rather
+      // than nothing — "result" should answer "how did the last fight end?".
+      const f = this.lastFight;
+      if (f) return { ok: true, msg: `${f.result} — ${f.reason} (mob fight: ${f.target}, swings ${f.swings}, confirmed ${f.confirmedHits})`, data: { kind: 'mob-fight', ...f } };
+      return { ok: false, msg: 'no pvp fight recorded yet' };
+    }
     const s = this.pvp.summary();
     return {
       ok: true,
@@ -819,12 +837,38 @@ class Actor {
       }
       case 'attack': {
         const name = args[0];
-        const target = findEntityNamed(bot, name);
-        if (!target) return { ok: false, msg: `cannot find entity ${name}` };
-        this._fightTarget = target;
-        this.mode = 'fight';
-        this.fightLoop().catch(e => this.log.debug('fight loop ended', { error: e.message }));
-        return { ok: true, msg: `Attacking ${name}` };
+        if (!name) return { ok: false, msg: 'usage: attack <mob> | attack hostile' };
+        // Pick the NEAREST entity matching the name. findEntityNamed returns the
+        // first match in entity-id order, and on a populated server that is
+        // routinely a mob on another Y level: radar shows XZ only, so it looked
+        // 9 blocks away while the real 3D distance was 60+ — the chase gave up at
+        // arm time with zero swings, which is indistinguishable from a bug.
+        const want = String(name).toLowerCase();
+        const any = want === 'hostile' || want === 'mob' || want === 'any';
+        let target = null, bestD = Infinity;
+        if (bot.entities && bot.entity) {
+          for (const id in bot.entities) {
+            const e2 = bot.entities[id];
+            if (!e2 || e2 === bot.entity || e2.isValid === false || !e2.position) continue;
+            const nm = String(e2.username || e2.name || '').toLowerCase();
+            if (any) { if (!isHostileEntity(e2)) continue; }
+            else if (!nm || !(nm === want || nm.includes(want))) continue;
+            const d = bot.entity.position.distanceTo(e2.position);
+            if (d < bestD) { bestD = d; target = e2; }
+          }
+        }
+        if (!target && !any) target = findEntityNamed(bot, name);
+        if (!target) return { ok: false, msg: `cannot find ${any ? 'a hostile mob' : `entity ${name}`} in view` };
+        if (bestD > 48) {
+          // Say so instead of arming a chase that cannot start: the loop's only
+          // end for an unreachable target is 'target lost', which reads like a bug.
+          return { ok: false, msg: `nearest ${any ? 'hostile' : name} is ${Math.round(bestD)} blocks away (out of reach)` };
+        }
+        // Route through the shared fight entry point. Setting mode + target by
+        // hand here skipped tracker.setTarget() and the vitals arm, so a real
+        // kill could not be told apart from a despawn and `result` stayed empty.
+        this._beginFight(target, 'order');
+        return { ok: true, msg: `Attacking ${target.name || target.username} at ${Math.round(bestD)} blocks` };
       }
       case 'pvp': {
         // pvp <player> [tier 0..1]  — tier names map to numbers
@@ -1072,7 +1116,7 @@ class Actor {
       const h = bot.health != null ? bot.health : 20;
       if (!threat || h >= (s.fleeHealth != null ? s.fleeHealth : 10) + 6) {
         this.log.info('actor: safe again, resuming', { mode: this.prevMode, health: +h.toFixed(1) });
-        this.setMode(this.prevMode || 'afk');
+        this._restoreAfterCombat();
         return;
       }
       // refresh the escape route every few seconds as the threat follows
@@ -1098,6 +1142,22 @@ class Actor {
       }
       await sleep(350);
     }
+  }
+
+  /**
+   * Restore the resting mode when a fight ends.
+   *
+   * A mob engagement is transient. If prevMode is itself a combat mode — an
+   * operator's `attack`, or the loop's own 'fight' — restoring it re-arms the
+   * very loop whose exit called setMode, so attack -> fight -> lost -> attack ->
+   * ... overflowed the stack live within milliseconds of one unreachable target.
+   * Those goals end by standing down, which is also what a player expects after
+   * a kill: the bot stops chasing.
+   */
+  _restoreAfterCombat() {
+    const p = this.prevMode;
+    const transient = !p || p === 'fight' || p === 'attack' || p === 'kill' || p === 'pvp';
+    return this.setMode(transient ? 'afk' : p);
   }
 
   /** Flee with the direct controller, for when the pathfinder has no route. */
@@ -1127,13 +1187,34 @@ class Actor {
     const bot = this.bot;
     const startedAt = Date.now();
     const maxMs = this.cfg.fight && this.cfg.fight.maxMs ? this.cfg.fight.maxMs : 20000;
-    let swaps = 0, lastTarget = null;
+    let swaps = 0, lastTarget = null, swings = 0;
     while (this.mode === 'fight' && !this.destroyed) {
       const target = this._fightTarget;
       const e = typeof target === 'function' ? target() : target;
       if (!e || !e.isValid || (e.position && bot.entity.position.distanceTo(e.position) > 48)) {
-        this.log.info('actor: target lost, returning to previous mode');
-        this.setMode(this.prevMode || 'afk');
+        // Why the target went away, kept in the record: "target lost" on its own
+        // is the one outcome that is indistinguishable from a bug, and on a live
+        // server it is usually a mob that walked out of the 48-block chase window.
+        const lostCause = !e ? 'no target handle'
+          : e.isValid === false ? 'entity_destroyed (isValid=false)' : 'out of 48 blocks';
+        // Same rule as the duel: only a server signal ends it. `!e.isValid` is
+        // true both for a corpse we just made and for a despawn we had nothing
+        // to do with, so the verdict comes from the death packet the tracker
+        // saw, never from the absence of the entity.
+        const v = this._fightVitals;
+        const killed = !!(v && v.dead);
+        this.lastFight = {
+          result: killed ? 'win' : 'target-lost',
+          reason: killed ? 'opponent died' : 'target lost',
+          target: (e && (e.username || e.name || e.displayName)) || null,
+          swings,
+          confirmedHits: v ? (v.confirmedHit || 0) : 0,
+          durationMs: Date.now() - startedAt,
+          at: new Date().toISOString(),
+          lostCause
+        };
+        this.log[killed ? 'info' : 'warn']('actor: fight ended', this.lastFight);
+        this._restoreAfterCombat();
         return;
       }
       // If we keep getting bounced to new targets (a swarm), fighting is not
@@ -1176,6 +1257,7 @@ class Actor {
         const cd = this.cfg.fight && this.cfg.fight.swingCdMs ? this.cfg.fight.swingCdMs : 600;
         if (!this._attackCd || Date.now() - this._attackCd > cd) {
           this._attackCd = Date.now();
+          swings++;
           try { await bot.attack(e); } catch (_) {}
         }
       }
@@ -1693,7 +1775,7 @@ class Actor {
       if (food < 18) this.eat().catch(() => {});
     } else if (this.mode === 'flee' && health >= (s.fleeHealth != null ? s.fleeHealth : 10) + 6) {
       this.log.info('actor: recovered, resuming', { mode: this.prevMode });
-      this.setMode(this.prevMode || 'afk');
+      this._restoreAfterCombat();
     }
 
     // eat when hungry. Eating is not aggressive — a passive bot still needs
@@ -1924,13 +2006,25 @@ function nearestHostile(bot, range) {
     // mineflayer sets e.kind to a human-readable string like "Hostile mobs"
     // and e.displayName to the entity name (e.g. "Zombie"), so match both
     // case-insensitively against the hostile set. (e.mobType is deprecated.)
-    const mobType = String(e.displayName || e.name || '').toLowerCase();
-    const hostile = e.kind === 'hostile' || /hostile/.test(String(e.kind || '')) || HOSTILE_MOBS.has(mobType);
-    if (!hostile) continue;
+    if (!isHostileEntity(e)) continue;
     const d = bot.entity.position.distanceTo(e.position);
     if (d <= bestD) { bestD = d; best = e; }
   }
   return best;
+}
+
+/**
+ * One hostile predicate for every consumer. mineflayer sets `kind` to a
+ * human-readable string like "Hostile mobs" and `displayName`/`name` to the
+ * entity name; matching only one of them silently misses mobs (and matched
+ * bats/items as hostiles before). Shared so `attack hostile`, the flee radius
+ * and the night gate all agree on what counts as dangerous.
+ */
+function isHostileEntity(e) {
+  if (!e) return false;
+  const kind = String(e.kind || '');
+  const mobType = String(e.displayName || e.name || '').toLowerCase();
+  return /hostile/.test(kind) || HOSTILE_MOBS.has(mobType);
 }
 
 /** Count hostiles within `range`. Used by the gather night gate to decide

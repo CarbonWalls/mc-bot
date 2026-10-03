@@ -1,0 +1,28 @@
+# Live mob kill evidence — real server, no human involved
+# captured 2026-10-03T09:51:37Z
+
+## server
+2026-10-03T09:36:35.390Z INFO  server ping version=Paper 1.21.11 protocol=774 supported=true knownAs=1.21.11
+2026-10-03T09:36:36.808Z INFO  spawned into world username=AFK_Bot dimension=overworld position={"x":6.5,"y":157,"z":32.5} spawns=1
+
+## daemon log: engagement -> observed death -> verdict
+2026-10-03T09:50:47.496Z INFO  actor: engaging why=order mob=zombie
+2026-10-03T09:50:59.928Z INFO  actor: fight ended result=win reason=opponent died target=zombie swings=17 confirmedHits=16 durationMs=12432 at=2026-10-03T09:50:59.928Z diag=entity_destroyed (isValid=false)
+
+## mc result (JSON, as reported by the daemon)
+{
+  "kind": "mob-fight",
+  "result": "win",
+  "reason": "opponent died",
+  "target": "zombie",
+  "swings": 17,
+  "confirmedHits": 16,
+  "durationMs": 12432,
+  "at": "2026-10-03T09:50:59.928Z",
+  "diag": "entity_destroyed (isValid=false)"
+}
+
+## Note on the log field
+The live run captured `diag=entity_destroyed (isValid=false)`. That field was
+renamed to `lostCause` in the committed revision (same value, clearer name);
+the verdict fields above (result/reason/target/swings/confirmedHits) are unchanged.

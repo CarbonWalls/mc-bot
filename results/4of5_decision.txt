@@ -1,0 +1,20 @@
+# 4of5.aternos.me:44640 — DECISION: explicitly accepted as UNJOINABLE
+# decided 2026-10-03T10:05:00Z
+
+## Why
+Downgrading the server to 26.1 is not something this project can do: 4of5 is a
+third-party Aternos instance and its protocol is set by the Paper build the owner
+installs. The bot can only refuse it, which it does at PING time.
+
+## Evidence — probe, 2026-10-03T10:05:00Z
+  4of5      4of5.aternos.me:44640  no response / unreachable
+  joinable now: mc start --host betahhd.aternos.me --port 49851
+
+## Evidence — earlier same address, awake (previous session, recorded)
+  4of5.aternos.me:44640  Paper 26.2 (protocol 776)  UNJOINABLE
+  no published minecraft-data ships a data directory for 776; the highest
+  supported is 775/26.1, so connect is refused before login.
+
+## Consequence
+config/config.json default stays betahhd.aternos.me:49851 (Paper 1.21.11 / 774),
+which this session joined and verified live. No retry budget is spent on 4of5.
