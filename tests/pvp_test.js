@@ -24,9 +24,10 @@ const path = require('path');
 
 const ROOT = path.resolve(__dirname, '..');
 const SRC = path.join(ROOT, 'src');
-const { MockWorld, MockBot } = require(path.join(SRC, 'mock.js'));
+const { MockWorld, MockBot, setMetaHealth } = require(path.join(SRC, 'mock.js'));
 const { Actor } = require(path.join(SRC, 'actor.js'));
 const P = require(path.join(SRC, 'perceive.js'));
+const { tierFor } = require(path.join(SRC, 'pvp.js'));
 
 const FLOOR = 70;
 
@@ -43,6 +44,9 @@ function addPlayer(bot, name, pos, gamemode) {
   const ent = {
     id, username: name, name, displayName: name, type: 'player',
     kind: 'player', isValid: true, position: pos, health: undefined,
+    // Real entities carry `metadata` as a raw-value array; the mock mirrors that
+    // so the health reader can be exercised the way the wire does it.
+    metadata: [],
     equipment: []
   };
   bot.entities[id] = ent;
@@ -103,6 +107,43 @@ function register({ test, testAsync }) {
     // An estimate can now never contradict the observed value
     v.onHurt(10);
     assert.strictEqual(v.health, 3, 'observed health is not overwritten by arithmetic');
+  });
+
+  test('player health is read from entity metadata at the registry-declared slot', async () => {
+    // The reported bug: a player always showed "20 (estimated)" even at full
+    // health, because the reader scanned `entity.metadata` for an element with
+    // `key === 'health'` — but metadata is a raw-value ARRAY (prismarine-entity
+    // `metadata = []`), so nothing ever matched. Verified live on Paper 1.21.11:
+    // a player reads metadata[9]=20, a hurt player 13.33, a cow 10.
+    const { bot } = arena();
+    const t = new P.DamageTracker(bot, {});
+    const e = addPlayer(bot, 'Human', bot.entity.position.offset(2, 0, 0), 0);
+    const v = t.of(e);
+    assert.strictEqual(v.source, 'estimate', 'with no broadcast yet there is only a guess');
+
+    setMetaHealth(bot, e, 20);
+    assert.strictEqual(v.source, 'server', 'a metadata health value is a real reading');
+    assert.strictEqual(v.health, 20, 'full health is observed, not estimated');
+    assert.strictEqual(v.hearts, 10);
+
+    // and it tracks damage the way the server broadcasts it
+    setMetaHealth(bot, e, 7.5);
+    assert.strictEqual(v.health, 7.5, 'health follows the broadcast downward');
+    assert.strictEqual(v.hearts, 4, '7.5 hp shows as 4 hearts');
+    assert.ok(v.lastDamageAt > 0, 'a drop in broadcast health is real damage');
+    t.destroy();
+
+    // The index is not hard-coded: it must come from the registry table, or a
+    // future version that moves the slot would silently read the wrong field.
+    const keys = bot.registry.entitiesByName.player.metadataKeys;
+    assert.strictEqual(keys.indexOf('health'), 9, 'the registry names slot 9 as health on 1.21.x');
+    const shifted = { name: 'player', metadata: [] };
+    shifted.metadata[3] = 11;
+    const shiftedBot = { registry: { entitiesByName: { player: { metadataKeys: ['a', 'b', 'c', 'health'] } } } };
+    assert.strictEqual(P.healthFromMetadata(shiftedBot, shifted), 11,
+      'the slot is resolved through metadataKeys, not assumed to be 9');
+    assert.strictEqual(P.healthFromMetadata({ registry: {} }, { name: 'zombie', metadata: [] }), null,
+      'no reading is null, never a fabricated number');
   });
 
   test('the estimate cannot fall below observed damage nor above landed hits', async () => {
@@ -464,6 +505,35 @@ function register({ test, testAsync }) {
         `bot should be moving toward/jumping the step toward Steve, lastMove=${p.lastMove} z=${bot.entity.position.z.toFixed(2)}`);
       actor.destroy(); p.stop('test');
     });
+  });
+
+  test('pvp sprints while closing so the duel does not feel slow', async () => {
+    // Reported: "when it is pvping, it doesn't seem capable of sprinting, which
+    // makes it feel slow". The gate was `tier > 0.6 && dist > 6`, so a hard
+    // duelist walked the whole approach inside six blocks and never sprinted
+    // where it is most visible. Sprint is a control state, so assert the control
+    // itself — a distance heuristic would pass even if 'sprint' was never set.
+    //
+    // `_step` is exercised directly because the hard tier usually *orbits*
+    // (orbit 0.85), and orbit also sprints; routing the assertion through the
+    // loop would then pass on the orbit path and never test the closing gate it
+    // is meant to pin.
+    const { bot, actor } = makePvp();
+    const target = addPlayer(bot, 'Steve', bot.entity.position.offset(0, 0, 4.5), 0);
+    bot.entity.position.set(0.5, FLOOR + 1, 0.5);
+    bot.entity.yaw = 0;
+    actor.exec('pvp Steve 1.0');
+    const p = actor.pvp;
+    try {
+      const tier = tierFor(1.0);
+      const dist = bot.entity.position.distanceTo(target.position);
+      const way = p._step(target, dist, tier, 'close');
+      assert.ok(bot._controls.sprint === true,
+        `closing from ${dist.toFixed(1)} blocks must sprint, way=${way} sprint=${bot._controls.sprint}`);
+      assert.ok(bot._controls.forward, 'and sprint is paired with forward, or physics ignores it');
+    } finally {
+      actor.destroy(); p.stop('test');
+    }
   });
 
   test('pvp does not orbit off a cliff', async () => {

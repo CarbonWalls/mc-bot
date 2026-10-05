@@ -798,7 +798,12 @@ class PvpController {
         allowFall: false,
         maxDrop: this.maxDrop,
         hop: this.hopEnabled,
-        sprint: false,
+        // Orbit *with* sprint: a strafing circle is still forward locomotion in
+        // prismarine-physics (`sprint` adds the speed modifier regardless of the
+        // strafe axis), so holding it makes the bot noticeably harder to lead —
+        // the original "feels slow" complaint. Kept off only when the caller is
+        // deliberately holding the line at low speed.
+        sprint: true,
         strafe: orbitBias || undefined
       });
       return;
@@ -921,7 +926,14 @@ class PvpController {
       allowFall: true,
       maxDrop: this.descendMax,
       hop: this.hopEnabled,
-      sprint: this.tier > 0.6 && dist > 6,
+      // Sprint whenever we are actually closing ground (reported: "when it is
+      // pvping, it doesn't seem capable of sprinting, which makes it feel slow").
+      // The old gate was `tier > 0.6 && dist > 6`, so a hard duelist walked the
+      // whole approach and only sprinted while still far away — and never in the
+      // last, most-visible six blocks. movement.js already refuses sprint on a
+      // step/jump/hop and while off the ground, so it is safe to ask for it the
+      // moment the target is more than a stride away.
+      sprint: dist > 2.2,
       detour: true
     });
   }
@@ -972,7 +984,13 @@ class PvpController {
     const bot = this.bot;
     if (!this.actor || typeof this.actor.eat !== 'function') return;
     const food = bot.food != null ? bot.food : 20;
-    if (food < 17 && !this.actor.eating) {
+    const hp = bot.health != null ? bot.health : 20;
+    // 18 is the natural-regeneration floor in 1.9+, so eating below it keeps our
+    // own HP recovering during a duel; 17 (the old gate) was under that line, so
+    // a duelist at 17 food could neither regen nor be told to eat. A hurt
+    // duelist tops up to full food — healing is worth more than the swing it costs.
+    const want = hp < 20 ? 20 : 18;
+    if (food < want && !this.actor.eating) {
       if (!this._lastEatAt || Date.now() - this._lastEatAt > 9000) {
         this._lastEatAt = Date.now();
         this.actor.eat().catch(() => {});

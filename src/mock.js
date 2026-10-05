@@ -388,8 +388,14 @@ class MockBot extends EventEmitter {
     const steve = {
       id: this._nextId++, username: 'Steve', name: 'Steve', displayName: 'Steve',
       type: 'player', kind: 'player', isValid: true, health: undefined,
+      // Real mineflayer entities carry `metadata` as a plain array indexed by
+      // metadata key (prismarine-entity sets `metadata = []`), with health at the
+      // index the registry's metadataKeys names. The mock had no metadata at all,
+      // so the "can't see my actual health" reader could not be tested offline.
+      metadata: [],
       position: new Vec3(6, y + 1, -4), velocity: new Vec3(0, 0, 0), equipment: []
     };
+    setMetaHealth(this, steve, 20);
     this.entities[steve.id] = steve;
     // mineflayer's bot.players[name] is a *player record* (uuid, username,
     // gamemode, ping, entity), not the entity itself. Matching that shape matters:
@@ -691,16 +697,24 @@ class MockBot extends EventEmitter {
     if (entity.isValid === false) return;
     this.emit('animation', { entityId: entity.id, animation: 1 });
     this.emit('entityHurt', entity, this.entity);
-    if (entity.health != null) {
-      entity.health -= 4;
-      if (entity.health <= 0) {
-        entity.isValid = false;
-        this.emit('entityDead', entity);
-        delete this.entities[entity.id];
-        this.emit('entityGone', entity);
-      } else {
-        this.emit('entityUpdate', entity);
-      }
+    /* Health travels in the metadata slot on the wire — for mobs AND players —
+     * and that is the field perception now reads. Reducing only `entity.health`
+     * left a broadcast health frozen at 20, which made every opponent look
+     * invulnerable: a full duel read back as `no-fight — opponent took no damage
+     * over 4 confirmed hits`, and the offline suite could not see it because it
+     * asserts on the estimate path. This is the mock/real drift the api-contract
+     * test exists to catch, so the mock has to move the slot the server moves. */
+    const before = entity.health != null ? entity.health
+      : (Array.isArray(entity.metadata) && entity.metadata[9] != null ? entity.metadata[9] : null);
+    if (before == null) return;          // no health signal: swing only, no damage
+    const after = Math.max(0, +(before - 4).toFixed(2));
+    if (entity.health != null) entity.health = after;
+    setMetaHealth(this, entity, after);   // emits 'entityUpdate', like the server
+    if (after <= 0) {
+      entity.isValid = false;
+      this.emit('entityDead', entity);
+      delete this.entities[entity.id];
+      this.emit('entityGone', entity);
     }
   }
   async look(yaw, pitch, force) { this.entity.yaw = yaw; this.entity.pitch = pitch; }
@@ -779,8 +793,36 @@ function goalTarget(goal) {
  */
 function makeMockRegistry() {
   const container = () => new Proxy({}, { get: (t, k) => (typeof k === 'string' ? { name: k } : undefined) });
+  // entitiesByName must answer with the real metadataKeys table, because
+  // perception resolves the health slot by looking up 'health' in it (the same
+  // table mineflayer and minecraft-data ship). A bare `{ name }` stub made the
+  // reader fall back to a hard-coded index, so the mock could not catch a wrong
+  // index — which is exactly the bug that hid player health.
+  const LIVING_KEYS = ['shared_flags', 'air_supply', 'custom_name', 'custom_name_visible',
+    'silent', 'no_gravity', 'pose', 'ticks_frozen', 'living_entity_flags', 'health'];
+  const entitiesByName = new Proxy({}, {
+    get: (t, k) => (typeof k === 'string' ? { name: k, metadataKeys: LIVING_KEYS } : undefined)
+  });
   return new Proxy(
-    { foodsByName: { bread: 1, cooked_beef: 1, apple: 1, baked_potato: 1, cooked_porkchop: 1 } },
+    {
+      // Real registry food entries carry foodPoints/saturation/effectiveQuality
+      // (see minecraft-data foodsByName); the mock mirrors that shape so food
+      // *ranking* (prefer steak over bread, never a spider eye) is testable.
+      foodsByName: {
+        bread: { name: 'bread', foodPoints: 5, saturation: 60, effectiveQuality: 65 },
+        cooked_beef: { name: 'cooked_beef', foodPoints: 8, saturation: 12.8, effectiveQuality: 20.8 },
+        beef: { name: 'beef', foodPoints: 3, saturation: 1.8, effectiveQuality: 4.8 },
+        apple: { name: 'apple', foodPoints: 4, saturation: 2.4, effectiveQuality: 6.4 },
+        baked_potato: { name: 'baked_potato', foodPoints: 5, saturation: 6, effectiveQuality: 11 },
+        golden_apple: { name: 'golden_apple', foodPoints: 4, saturation: 9.6, effectiveQuality: 13.6 },
+        cooked_porkchop: { name: 'cooked_porkchop', foodPoints: 8, saturation: 12.8, effectiveQuality: 20.8 },
+        spider_eye: { name: 'spider_eye', foodPoints: 2, saturation: 12.8, effectiveQuality: 14.8 },
+        rotten_flesh: { name: 'rotten_flesh', foodPoints: 4, saturation: 6.4, effectiveQuality: 10.4 },
+        poisonous_potato: { name: 'poisonous_potato', foodPoints: 2, saturation: 4.8, effectiveQuality: 6.8 },
+        pufferfish: { name: 'pufferfish', foodPoints: 1, saturation: 0.4, effectiveQuality: 1.4 }
+      },
+      entitiesByName
+    },
     {
       get: (target, prop) =>
         (prop in target) ? target[prop] :
@@ -790,10 +832,26 @@ function makeMockRegistry() {
   );
 }
 
+/**
+ * Set an entity's broadcast health the way the wire does: the raw metadata array
+ * at the index `metadataKeys` names for 'health' (= 9 on 1.21.x). Tests use this
+ * to hand the bot a real reading, so "observed" vs "estimated" is exercised the
+ * way the live server exercises it rather than by poking Vitals directly.
+ */
+function setMetaHealth(bot, entity, hp) {
+  if (!entity) return;
+  if (!Array.isArray(entity.metadata)) entity.metadata = [];
+  entity.metadata[9] = hp;
+  if (bot && typeof bot.emit === 'function') {
+    entity.metadata = entity.metadata.slice();
+    bot.emit('entityUpdate', entity);
+  }
+}
+
 /** Create a mock bot + world that BotCore can use in place of mineflayer. */
 function createMockBot(opts) {
   const world = new MockWorld();
   return new MockBot(world, opts);
 }
 
-module.exports = { MockWorld, MockBot, createMockBot, WORLD_MIN_Y, WORLD_MAX_Y };
+module.exports = { MockWorld, MockBot, createMockBot, setMetaHealth, WORLD_MIN_Y, WORLD_MAX_Y };

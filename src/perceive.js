@@ -34,6 +34,51 @@
 
 const GAMEMODE_NAMES = ['survival', 'creative', 'adventure', 'spectator'];
 
+/**
+ * The health the server broadcast for an entity, or null when it sent none.
+ *
+ * WHY THIS EXISTS (reported: "it can't see my actual health")
+ * -----------------------------------------------------------
+ * Every player and mob was displayed as "20 (estimated)" forever, even at full
+ * health, because the reader looked at the wrong shape. `entity.metadata` is a
+ * plain *array* indexed by metadata key (prismarine-entity sets `metadata = []`
+ * and mineflayer's parseMetadata assigns `entityMetadata[key] = value`), so the
+ * old scan for an element with `key === 'health'` matched nothing — arrays do
+ * not have a `.key`. The health value was on the wire the whole time: verified
+ * live on Paper 1.21.11, a player reads `metadata[9] = 20`, a hurt player
+ * `13.33`, a cow `10`, a damaged skeleton `9`.
+ *
+ * The index is not hard-coded: it is read from the registry's own
+ * `entitiesByName[name].metadataKeys`, which ships with minecraft-data and is
+ * what mineflayer itself uses to name slots. The array fast-path keeps the old
+ * index-9 behaviour as a fallback for a build whose registry lacks the table;
+ * the keyed-object branch is kept so a future/alternate parser that already
+ * resolves keys still works. Returns null (rather than a guess) when nothing is
+ * available, so callers keep the estimate discipline.
+ */
+function healthFromMetadata(bot, entity, fallbackIndex = 9) {
+  const md = entity && entity.metadata;
+  if (md == null) return null;
+  let idx = fallbackIndex;
+  try {
+    const keys = bot && bot.registry && bot.registry.entitiesByName &&
+      bot.registry.entitiesByName[entity.name] && bot.registry.entitiesByName[entity.name].metadataKeys;
+    if (Array.isArray(keys)) {
+      const i = keys.indexOf('health');
+      if (i >= 0) return readHealthSlot(md, i);
+    }
+  } catch (_) { /* registry absent: fall through to the documented index */ }
+  return readHealthSlot(md, idx);
+}
+
+/** Pull a health number from either metadata shape (raw array, or keyed map). */
+function readHealthSlot(md, idx) {
+  let val;
+  if (Array.isArray(md)) val = md[idx] == null ? md[9] : md[idx];
+  else if (typeof md === 'object') val = md.health != null ? md.health : md[idx];
+  return Number.isFinite(val) ? val : null;
+}
+
 /** Vanilla hearts: 2 HP per heart, and a partial heart still shows as a heart. */
 function hearts(hp) {
   if (hp == null || !Number.isFinite(hp)) return null;
@@ -386,20 +431,15 @@ class DamageTracker {
       if (this.target && entity === this.target) this.lastTargetSwingAt = Date.now();
     });
     on('entityUpdate', (entity) => {
-      // mineflayer emits 'entityUpdate' after parsing metadata into a keyed
-      // object; there is no 'entityMetadata' event, so listening for that name
-      // would never see a broadcast health value.
+      // mineflayer emits 'entityUpdate' after parsing metadata into a plain
+      // array indexed by metadata key; there is no 'entityMetadata' event, so
+      // listening for that name would never see a broadcast health value.
       const v = this.of(entity);
       if (!v) return;
-      const md = entity.metadata;
-      let mh = null;
-      if (md && typeof md === 'object') {
-        if (!Array.isArray(md) && typeof md.health === 'number') mh = md.health;
-        else if (Array.isArray(md)) {
-          const hit = md.find(m => m && (m.key === 'health' || m.key === 6) && typeof m.value === 'number');
-          if (hit) mh = hit.value;
-        }
-      }
+      // Read the slot through the registry's own metadataKeys table — the old
+      // scan for `{ key: 'health' }` could never match an array, which is why
+      // every player and mob read as "20 (estimated)" even at full health.
+      const mh = healthFromMetadata(bot, entity);
       // A live server reports 0 for a corpse and never 0 for a healthy entity, so
       // accept any finite number: rejecting 0 here would drop the death reading.
       if (mh != null && Number.isFinite(mh) && mh >= 0) {
@@ -516,14 +556,18 @@ class DamageTracker {
       // fleeing is never the thing that gets dropped.
       if (this.entities.size >= (this.maxTracked || 64)) this._evict();
       const isPlayer = !!entity.username || entity.type === 'player' || entity.kind === 'player';
-      // Mobs report health through entity metadata on most servers; players
-      // never do on a vanilla one. Start optimistic and let a real packet flip
-      // `known`.
+      // Mobs and *players* both broadcast health through entity metadata on
+      // current servers (verified live on Paper 1.21.11); `entity.health` is
+      // never set by mineflayer, so reading it was always a dead branch. Seed
+      // from the metadata slot when the entity arrives, so a player's real HP
+      // is known before the first update packet.
+      const mdHealth = healthFromMetadata(this.bot, entity);
+      const hasHealth = mdHealth != null && Number.isFinite(mdHealth) && mdHealth >= 0;
       v = new Vitals({
-        maxHealth: isPlayer ? 20 : (entity.health != null ? entity.health : 20),
-        known: !isPlayer && entity.health != null
+        maxHealth: isPlayer ? 20 : (mdHealth != null ? Math.max(20, mdHealth) : 20),
+        known: hasHealth
       });
-      if (entity.health != null) { v.confirmed = entity.health; v.estimate = entity.health; }
+      if (hasHealth) { v.confirmed = mdHealth; v.estimate = mdHealth; }
       if (isPlayer) {
         v.username = entity.username;
         v.gameMode = gameModeOf(this.bot, entity.username);
@@ -653,5 +697,6 @@ module.exports = {
   ownGameMode,
   isUnkillable,
   findByUsername,
+  healthFromMetadata,
   GAMEMODE_NAMES
 };

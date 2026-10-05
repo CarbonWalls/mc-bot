@@ -189,6 +189,129 @@ function register({ test }) {
     assert.doesNotThrow(() => actor.tick());
     assert.strictEqual(actor.stuckAttempts, 0, 'an idle bot must never be flagged stuck');
   });
+
+  test('a recovery in flight must not forgive the stall it is recovering from', () => {
+    // Reported live as a bot wedged forever: `moving again` reset the counter on
+    // the tiny movement the recovery's own walk produced, so attempts oscillated
+    // 1 -> 2 -> 1 -> 2 and never reached the cap, and the bot never re-rolled its
+    // unreachable wander target. While _recovering is true the counter must hold.
+    const { actor, bot } = makeActor({ stuckTimeoutMs: 400, maxStuckAttempts: 4 });
+    actor.stuckAttempts = 2;
+    actor._recovering = true;
+    actor.lastPos = bot.entity.position.clone().offset(1, 0, 0);   // > 0.2 blocks moved
+    actor.lastMoveAt = Date.now();
+    bot.pathfinder._goal = { type: 'near', x: 500, y: 70, z: 500, range: 3 };
+    bot.pathfinder._moving = true;
+    actor.goalDesc = bot.pathfinder._goal;
+    actor.goalStartedAt = Date.now() - 30000;
+    actor.tick();
+    assert.strictEqual(actor.stuckAttempts, 2,
+      'the stall budget must survive the recovery that has not fixed the stall');
+    // Once the recovery is over, movement legitimately forgives the stall again.
+    actor._recovering = false;
+    actor.lastPos = bot.entity.position.clone().offset(1, 0, 0);   // moved again
+    actor.tick();
+    assert.strictEqual(actor.stuckAttempts, 0, 'after recovery, real movement forgives past stalls');
+    actor.destroy();
+  });
+
+  test('recovery has a descent phase: a goal below the bot is not a dead end', async () => {
+    // Reported: "wander gets stuck on the current level of y (it doesn't want to
+    // fall or go up 1 block or more)". The ladder could only jump, climb UP, or
+    // dig, so a goal below had no move at all. This asserts the phase exists and
+    // is asked for with a descent budget; the live log confirms it runs end to
+    // end (`goal is below, stepping down dy=-11` then the bot drops y=70 -> 63).
+    //
+    // Phase 1 is stubbed to make no progress so the descent branch is the one
+    // exercised, instead of depending on the mock pathfinder's route choice.
+    const world = MockWorld.arena({ floorY: 70, radius: 24 });
+    const bot = new MockBot(world, { manualTicks: true });
+    bot._spawn();
+    for (const t of bot._timers) { clearInterval(t); clearTimeout(t); }
+    bot._timers = [];
+    const logs = [];
+    const actor = new Actor(bot, {
+      logger: { info: (m, d) => logs.push([m, d]), warn: (m, d) => logs.push([m, d]), error() {}, debug() {} },
+      config: { mode: 'afk', survive: { enabled: false }, stuckTimeoutMs: 400, maxStuckAttempts: 4, canDig: true }
+    });
+    actor.onSpawn();
+    bot.entity.position.set(0.5, world.surfaceY(0, 0) + 6, 0.5);
+    // A goal well below: the descent branch must be selected on the goal's dy.
+    actor.goalDesc = { type: 'near', x: 8, y: world.surfaceY(8, 8) + 1, z: 8, range: 2 };
+    const dy = actor.goalDesc.y - bot.entity.position.y;
+    assert.ok(dy < -0.5, `test precondition: the goal must be below the bot (dy=${dy})`);
+    // Phase 1 must not be allowed to claim the credit.
+    actor._progressSince = () => false;
+    const M = require(path.join(SRC, 'movement.js'));
+    const realWalk = M.walkToward;
+    const seen = [];
+    M.walkToward = (b, to, opts) => { seen.push(opts || {}); return 'blocked'; };
+    try {
+      await actor._recoverInner(1, 4, actor.goalDesc, bot);
+    } finally {
+      M.walkToward = realWalk;
+    }
+    const descending = logs.some(([m, d]) => m === 'actor: goal is below, stepping down' && d && d.dy < 0);
+    assert.ok(descending, 'the recovery ladder must contain a descent phase for a goal below');
+    const descentWalk = seen.find(o => o.allowEdge === true && o.maxDrop >= 3 && o.hop === false);
+    assert.ok(descentWalk,
+      'the descent walk must deliberately allow the edge with a safe 3-block budget ' +
+      `(opts seen: ${JSON.stringify(seen)})`);
+    actor.destroy();
+  });
+
+  test('wander only proposes targets the bot can actually walk to', () => {
+    // The root cause of "wander gets stuck on the current level of y": the picker
+    // measured every candidate column against a stale reference height and happily
+    // proposed a target across a cliff, which the pathfinder cannot route to. The
+    // live log proved it: `goal is below, stepping down dy=-12 maxDrop=3` while the
+    // bot never moved. A plateau above a deep plain makes the rule checkable.
+    const world = MockWorld.arena({ floorY: 70, radius: 40, cliffBeyondZ: 12, cliffDrop: 10 });
+    const bot = new MockBot(world, { manualTicks: true });
+    bot._spawn();
+    for (const t of bot._timers) { clearInterval(t); clearTimeout(t); }
+    bot._timers = [];
+    const actor = new Actor(bot, {
+      logger: { info() {}, warn() {}, error() {}, debug() {} },
+      config: { mode: 'wander', survive: { enabled: false }, movements: {} }
+    });
+    actor.onSpawn();
+    bot.entity.position.set(0.5, world.surfaceY(0, 0) + 1, 0.5);   // on the plateau
+    const hereY = bot.entity.position.y;
+    const ys = [];
+    for (let i = 0; i < 200; i++) {
+      const t = actor._randomReachable(40);
+      if (t) ys.push(t.y);
+    }
+    assert.ok(ys.length > 20, `the picker must still find targets (found ${ys.length}/200)`);
+    const outOfBand = ys.filter(y => y < hereY - 3 || y > hereY + 2);
+    assert.deepStrictEqual(outOfBand, [],
+      `targets must stay in the walkable band of y=${hereY} (-3 fall .. +2 climb), got ${[...new Set(outOfBand)]}`);
+    actor.destroy();
+  });
+
+  test('wander anchors on the bot, not on a stale home height', () => {
+    // Same bug, other half: home kept the Y it was set at, so a bot that had since
+    // descended was still offered targets measured from up there.
+    const world = MockWorld.arena({ floorY: 70, radius: 40 });
+    const bot = new MockBot(world, { manualTicks: true });
+    bot._spawn();
+    for (const t of bot._timers) { clearInterval(t); clearTimeout(t); }
+    bot._timers = [];
+    const actor = new Actor(bot, {
+      logger: { info() {}, warn() {}, error() {}, debug() {} },
+      config: { mode: 'wander', survive: { enabled: false }, movements: {} }
+    });
+    actor.onSpawn();
+    actor.home = { x: 0, y: 90, z: 0 };                            // stale home height
+    bot.entity.position.set(0.5, world.surfaceY(0, 0) + 1, 0.5);  // bot really at ~71
+    const ys = [];
+    for (let i = 0; i < 80; i++) { const t = actor._randomReachable(30); if (t) ys.push(t.y); }
+    assert.ok(ys.length > 0, 'the picker must still find targets');
+    assert.ok(ys.every(y => Math.abs(y - bot.entity.position.y) <= 2),
+      `targets must follow the BOT's height, not home's (ys=${[...new Set(ys)]}, botY=${bot.entity.position.y})`);
+    actor.destroy();
+  });
 }
 
 module.exports = { register };

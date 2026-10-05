@@ -1,5 +1,5 @@
 {
-  "at": "2026-10-03T10:11:26.765Z",
+  "at": "2026-10-05T14:15:56.314Z",
   "passed": 43,
   "failed": 0,
   "checks": [
@@ -26,22 +26,22 @@
     {
       "name": "wander moved the bot",
       "ok": true,
-      "extra": "{\"x\":-15.8,\"y\":71.1,\"z\":7.1}"
+      "extra": "{\"x\":20.8,\"y\":73,\"z\":16.6}"
     },
     {
       "name": "goto closed the distance to the target",
       "ok": true,
-      "extra": "23.6 -> 20.8"
+      "extra": "20.8 -> 0.8"
     },
     {
       "name": "goto stopped near the target or gave up cleanly",
       "ok": true,
-      "extra": "distance 20.8 mode afk"
+      "extra": "distance 0.8 mode afk"
     },
     {
       "name": "come returned the bot toward home",
       "ok": true,
-      "extra": "distance 0.2"
+      "extra": "distance 0"
     },
     {
       "name": "screenshot command succeeded",
@@ -91,22 +91,22 @@
     {
       "name": "status reports ground facts (surface / rise / drop)",
       "ok": true,
-      "extra": "{\"surface\":68,\"standY\":69,\"feetAboveSurface\":0,\"aheadRise\":1,\"aheadDrop\":-1,\"onGround\":true,\"inWater\":false,\"climbing\":true,\"exitRise\":1}"
+      "extra": "{\"surface\":66,\"standY\":67,\"feetAboveSurface\":0,\"aheadRise\":1,\"aheadDrop\":-1,\"onGround\":true,\"inWater\":false,\"climbing\":true,\"exitRise\":1}"
     },
     {
       "name": "goto moved the bot across real terrain",
       "ok": true,
-      "extra": "-3.6,0.7 -> 0.8,5.8"
+      "extra": "-32.2,9.7 -> -27.1,14.9"
     },
     {
       "name": "vertical change is possible (or the ground was genuinely flat)",
       "ok": true,
-      "extra": "y 69 -> 81 stuck=0"
+      "extra": "y 67 -> 64 stuck=0"
     },
     {
       "name": "jump reports an exit candidate or flat ground",
       "ok": true,
-      "extra": "hopped (facing). exit candidate: rise 1 dir 0,-1"
+      "extra": "hopped (facing). exit candidate: rise 1 dir 1,0"
     },
     {
       "name": "world probe returns ground facts",
@@ -136,12 +136,12 @@
     {
       "name": "observe <player> returns a gamemode (is it even fightable?)",
       "ok": true,
-      "extra": "{\"ok\":true,\"msg\":\"Steve: gamemode survival, health 20 (estimated), hearts 10\",\"data\":{\"name\":\"Steve\",\"gamemode\":\"survival\",\"visible\":true,\"distance\":7.3,\"vitals\":{\"health\":20,\"hearts\":10,\"max\":20,\"source\":\"estimate\",\"damageSeen\":0,\"confirmed\":null,\"estimate\":20,\"dead\":false,\"eating\":false,\"missedAttacks\":0,\"lastDamageAgoMs\":null,\"gameMode\":\"survival\"},\"killable\":true}}"
+      "extra": "{\"ok\":true,\"msg\":\"Steve: gamemode survival, health 20 (observed), hearts 10\",\"data\":{\"name\":\"Steve\",\"gamemode\":\"survival\",\"visible\":true,\"distance\":37.1,\"vitals\":{\"health\":20,\"hearts\":10,\"max\":20,\"source\":\"server\",\"damageSeen\":0,\"confirmed\":20,\"estimate\":20,\"dead\":false,\"eating\":false,\"missedAttacks\":0,\"lastDamageAgoMs\":null,\"gameMode\":\"survival\"},\"killable\":true}}"
     },
     {
       "name": "observe reports the health SOURCE (server vs estimate)",
       "ok": true,
-      "extra": "estimate"
+      "extra": "server"
     },
     {
       "name": "pvp starts against a visible player",
@@ -156,12 +156,12 @@
     {
       "name": "opponent estimate is labelled, never presented as observed",
       "ok": true,
-      "extra": "none"
+      "extra": "server"
     },
     {
       "name": "the duel moved the bot (it did not freeze on terrain)",
       "ok": true,
-      "extra": "hold"
+      "extra": "hop"
     },
     {
       "name": "pvp stops on command",
@@ -191,7 +191,7 @@
     {
       "name": "advisor state is visible in the summary",
       "ok": true,
-      "extra": "{\"mode\":\"assist\",\"last\":{\"action\":\"attack\",\"confidence\":0.73,\"aggression\":0.685,\"risk\":0.5925},\"applied\":\"attack\",\"client\":{\"enabled\":true,\"model\":\"jev-1.13.0\",\"unavailable\":false,\"pending\":1,\"cacheSize\":1,\"calls\":4,\"ok\":3,\"failed\":0,\"cached\":0,\"refused\":2,\"bytesIn\":2028,\"tokensOut\":318}}"
+      "extra": "{\"mode\":\"assist\",\"last\":{\"action\":\"attack\",\"confidence\":0.4,\"aggression\":0.5575,\"risk\":0.455},\"applied\":\"attack\",\"client\":{\"enabled\":true,\"model\":\"jev-1.13.0\",\"unavailable\":false,\"pending\":0,\"cacheSize\":1,\"calls\":3,\"ok\":3,\"failed\":0,\"cached\":0,\"refused\":6,\"bytesIn\":1971,\"tokensOut\":297}}"
     },
     {
       "name": "the fight is still running regardless of the endpoint outcome",

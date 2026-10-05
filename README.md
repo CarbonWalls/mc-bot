@@ -249,7 +249,7 @@ install is still the passive bot.
   "mode": "afk",
   "survive": {
     "enabled": false,
-    "eatAt": 16,
+    "eatAt": 18,
     "fleeHealth": 10,
     "nightFleeRadius": 12,
     "attack": true,

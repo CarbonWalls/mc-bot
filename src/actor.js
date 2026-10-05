@@ -112,8 +112,20 @@ const FALLBACK_FOODS = new Set([
   'cod', 'cooked_salmon', 'salmon', 'baked_potato', 'potato', 'carrot',
   'beetroot', 'beetroot_soup', 'mushroom_stew', 'rabbit_stew', 'suspicious_stew',
   'dried_kelp', 'apple', 'golden_apple', 'enchanted_golden_apple', 'melon_slice',
-  'sweet_berries', 'glow_berries', 'honey_bottle', 'cookie', 'cake', 'pumpkin_pie',
-  'spider_eye', 'rotten_flesh', 'tropical_fish', 'pufferfish'
+  'sweet_berries', 'glow_berries', 'honey_bottle', 'cookie', 'cake', 'pumpkin_pie'
+]);
+
+/**
+ * Foods that hurt the eater. Eating these to heal is worse than not eating:
+ * spider_eye (poison), rotten_flesh (hunger), poisonous_potato (poison),
+ * pufferfish (poison + hunger) and tropical_fish (nausea). They are valid
+ * entries in the registry's `foodsByName`, so a naive "first item the registry
+ * calls food" picker chooses them — observed live as `ate item=spider_eye`
+ * while fleeing a spider at 7 hearts.
+ */
+const HARMFUL_FOODS = new Set([
+  'spider_eye', 'rotten_flesh', 'poisonous_potato', 'pufferfish', 'tropical_fish',
+  'chorus_fruit'
 ]);
 
 const TOOL_TIERS = ['netherite', 'diamond', 'iron', 'golden', 'stone', 'wooden'];
@@ -610,6 +622,9 @@ class Actor {
     try {
       bot.pathfinder.setGoal(goal, dynamic);
       this.goalStartedAt = Date.now();
+      // A new goal has a new "closest approach so far".
+      this._bestGoalDist = null;
+      this._trackGoalDistance();
       return true;
     } catch (e) {
       this.log.warn('actor: setGoal failed', { error: e.message });
@@ -622,6 +637,7 @@ class Actor {
     try { if (isPathingNow(bot)) bot.pathfinder.setGoal(null); } catch (_) {}
     try { if (bot.pathfinder) bot.pathfinder.setGoal(null, true); } catch (_) {}
     this.goalDesc = null;
+    this._bestGoalDist = null;
   }
 
   /**
@@ -933,6 +949,10 @@ class Actor {
     const bot = this.bot;
     const radius = this._wanderRadius || 64;
     while (this.mode === 'wander' && !this.destroyed) {
+      // A stall that reached the recovery cap asked for a fresh target rather
+      // than a silent stop: re-rolling is the whole point of wandering, and it is
+      // the honest response to "that column is behind an unclimbable rise".
+      this._wanderReroll = false;
       const target = this._randomReachable(radius);
       if (!target) {
         this.log.debug('actor: no wander target found, waiting');
@@ -942,7 +962,12 @@ class Actor {
       this._applyGoal(false);
       const deadline = Date.now() + (this.cfg.goalTimeoutMs || 300000);
       while (this.mode === 'wander' && this.goalDesc && Date.now() < deadline) {
+        if (this._wanderReroll) break;      // stuck past recovery: pick somewhere else
         await sleep(1000);
+      }
+      if (this._wanderReroll) {
+        this.log.info('actor: wander target unreachable, choosing another');
+        this._wanderReroll = false;
       }
       const delay = (this.cfg.wander && this.cfg.wander.minDelayMs) || 2500;
       await sleep(delay);
@@ -1272,25 +1297,52 @@ class Actor {
 
   _randomReachable(radius) {
     const bot = this.bot;
-    const origin = this.home || (bot.entity ? bot.entity.position.floored() : null);
-    if (!origin) return null;
+    // Anchor on the bot's CURRENT position. `home` carries the Y it was set at,
+    // so once the bot had wandered or fallen, every target was measured against a
+    // stale height and the picker happily proposed a column twelve blocks down on
+    // the far side of a cliff. The live log said exactly that:
+    //     goal is below, stepping down dy=-12 maxDrop=3
+    // — an unreachable target chased with the whole recovery ladder while the bot
+    // never moved, which is what "wander gets stuck on the current level of y"
+    // looks like from outside.
+    const here = bot.entity ? bot.entity.position.floored() : null;
+    if (!here) return null;
+    const fallbacks = [];
     for (let attempt = 0; attempt < 24; attempt++) {
       const ang = Math.random() * Math.PI * 2;
       const dist = 12 + Math.random() * radius;
-      const x = Math.floor(origin.x + Math.cos(ang) * dist);
-      const z = Math.floor(origin.z + Math.sin(ang) * dist);
-      const y = topSolidY(bot, x, z, origin.y);
+      const x = Math.floor(here.x + Math.cos(ang) * dist);
+      const z = Math.floor(here.z + Math.sin(ang) * dist);
+      const y = topSolidY(bot, x, z, here.y);
       if (y == null) continue;
       // Pick only columns the bot can actually stand in: the surface block is
       // under the feet, so the goal is y+1, and that cell plus headroom must be
       // free. Without this, wander asked the pathfinder to occupy solid ground
       // and it answered path_stop.
-      const col = T.columnInfo(bot, x, z, origin.y);
+      const col = T.columnInfo(bot, x, z, here.y);
       if (!col || col.headBlocked) continue;
       if (col.dropBeyond > 3) continue;           // do not wander onto a ledge
-      return { x, y: col.y, z };
+      // topSolidY answers with its `refY` when it finds no solid block inside its
+      // +/-24 search, i.e. a phantom surface in mid air over a deep column. A
+      // real standable cell is required, or the fallback reads as "reachable".
+      if (!T.isStandable(bot, x, col.y, z)) continue;
+      // A target has to be one the bot can WALK to: the pathfinder can climb one
+      // block (hard-capped at 1.2 in its own source) and fall at most
+      // `maxDropDown`, and the direct controller will not take a drop over three
+      // blocks because past that it costs health. Anything outside that band is
+      // not a destination, it is a stall.
+      // `here.y` is already the standing cell (position.floored() of a bot whose
+      // feet are at y=71 is 71), so the comparison is cell-to-cell; adding 1 here
+      // shifts the whole band up and lets a +3 climb through as if it were +2.
+      const dy = col.y - here.y;
+      if (dy >= -3 && dy <= 2) return { x, y: col.y, z };
+      fallbacks.push({ dy, cand: { x, y: col.y, z } });
     }
-    return null;
+    // Nothing inside the walkable band: prefer the smallest height difference, so
+    // even the fallback is the most reachable thing on offer rather than the first
+    // random column the roll happened to land on.
+    if (!fallbacks.length) return null;
+    return fallbacks.sort((a, b) => Math.abs(a.dy) - Math.abs(b.dy))[0].cand;
   }
 
   async _awaitGoal(timeoutMs) {
@@ -1438,11 +1490,20 @@ class Actor {
     // gave up on goals it could trivially reach. Give the pathfinder a grace
     // period after each goal change before judging movement at all.
     const settled = this.goalStartedAt ? (now - this.goalStartedAt) > 2500 : true;
+    this._trackGoalDistance();
 
     if (pathing && settled && !moved && now - this.lastMoveAt > (this.cfg.stuckTimeoutMs || 6000)) {
       this.unstick();
-    } else if (pathing && moved && now - this.lastMoveAt < 1000 && this.stuckAttempts > 0) {
-      this.stuckAttempts = 0;     // moving again: forgive past stalls
+    } else if (pathing && moved && now - this.lastMoveAt < 1000 && this.stuckAttempts > 0 && !this._recovering) {
+      // Moving again: forgive past stalls — but NOT while a recovery is in
+      // flight. The recovery's own walk/jump moves the bot a fraction of a
+      // block, which reset the counter every time, so a bot wedged against a
+      // wall looped `attempt=1 -> 2 -> 1 -> 2` forever instead of ever reaching
+      // the cap and re-rolling a reachable wander target. Observed live:
+      //     stuck, recovering attempt=1 ... attempt=2 ... attempt=1 ...
+      //     (never "giving up after repeated stalls")
+      // A stall that survives a full recovery must keep its budget.
+      this.stuckAttempts = 0;
     }
 
     /* Proactive assistance. The watchdog above only fires after 6 s of nothing,
@@ -1604,6 +1665,9 @@ class Actor {
      */
     if (this._recovering) return;
     this.stuckAttempts++;
+    // Snapshot the closest approach so far; `_progressSince()` then asks whether
+    // this recovery beat it, which oscillation cannot satisfy forever.
+    this._recoverBestDist = this._bestGoalDist;
     const attempt = this.stuckAttempts;
     const cap = this.cfg.maxStuckAttempts || 4;
     const p = bot.entity ? bot.entity.position : null;
@@ -1616,6 +1680,16 @@ class Actor {
       this.log.warn('actor: giving up after repeated stalls', { attempts: attempt });
       this._clearGoal();
       M.clearAll(bot);
+      // A wander that gives up should wander *elsewhere*, not stop. Without this
+      // the bot reached the cap once and then sat at the unreachable spot until
+      // the next mode change — the live "stuck on the current level" report.
+      // Other modes (goto/gather) legitimately stop; wander re-rolls a target.
+      if (this.mode === 'wander') {
+        this.stuckAttempts = 0;
+        this._wanderReroll = true;
+        this._wanderAfter = Date.now() + 400;
+        return;
+      }
       this.setMode('afk');
       return;
     }
@@ -1665,6 +1739,51 @@ class Actor {
       }
     }
 
+    // 2) the goal is BELOW us: step down toward it.
+    //    This phase did not exist, and it is why the wanderer "gets stuck on the
+    //    current level of y" — the ladder could only walk-jump, climb UP, or dig,
+    //    so a goal one or two blocks lower (or across a downslope the pathfinder
+    //    refused) had no move at all. A drop of up to 3 blocks costs no health.
+    const dy = (desc.y != null && bot.entity) ? (desc.y - bot.entity.position.y) : 0;
+    if (heading && dy < -0.5) {
+      const dropBudget = Math.min(3, Math.max(1, Math.ceil(-dy) + 1));
+      this.log.info('actor: goal is below, stepping down', { dy: +dy.toFixed(1), maxDrop: dropBudget });
+      for (let i = 0; i < 10 && this.goalDesc === desc && !this.destroyed && this.mode !== 'pvp'; i++) {
+        const way = M.walkToward(bot, heading, {
+          // `allowEdge` is the important part: standing on a 1x1 pillar or at a
+          // rim, every exit is a drop, and the default ledge refusal made the
+          // descent phase hold `forward` into a wall and never move — the live
+          // "stuck on the current level of y" case, reproduced on a pillar:
+          // climbOut reported `failed` after 2.6 s of forward with no jump. When
+          // the goal is genuinely below us, walking off the edge IS the move.
+          allowFall: true, maxDrop: dropBudget, allowEdge: true, hop: false, sprint: false
+        });
+        if (way === 'blocked' && i > 3) break;
+        await sleep(140);
+      }
+      M.clearAll(bot);
+      reArm();
+      if (this._progressSince()) {
+        this.log.info('actor: recovered by descending', { attempt });
+        this.stuckAttempts = Math.max(0, attempt - 2);
+        this._replan(desc, attempt, cap);
+        return;
+      }
+      // A ledge lip or a one-block rim can refuse the walk; dig the block under
+      // our feet toward the goal so the drop becomes walkable, then re-plan.
+      if (this.cfg.canDig !== false && typeof bot.dig === 'function') {
+        const pos = bot.entity.position;
+        const dx = Math.sign(heading.x - pos.x), dz = Math.sign(heading.z - pos.z);
+        const under = bot.blockAt(probe(Math.floor(pos.x + dx), Math.floor(pos.y - 1), Math.floor(pos.z + dz)));
+        if (under && under.name !== 'air' && under.name !== 'bedrock' && T.isSolidBlock(under)) {
+          this.log.info('actor: digging down toward the goal', { block: under.name, at: [Math.floor(pos.x + dx), Math.floor(pos.y - 1), Math.floor(pos.z + dz)] });
+          await this.equipToolFor(under.name);
+          await this._digBlock(under);
+          reArm();
+        }
+      }
+    }
+
     // 2) are we in a hole? One block is enough to strand a bot whose only route
     //    was straight up, and the pathfinder will not plan a 2-block climb.
     const exit = M.bestExitDirection(bot, { hop: true });
@@ -1698,15 +1817,143 @@ class Actor {
           if (!T.isSolidBlock(b)) continue;
           this.log.info('actor: digging the obstruction', { block: b.name, at: [x, y, z] });
           await this.equipToolFor(b.name);
-          bot.dig(b, true).catch(() => {});
-          await sleep(900);
+          await this._digBlock(b);
           reArm();
           break;
         }
       } catch (e) { this.log.debug('actor: unstick dig failed', { error: e.message }); }
+      if (this._progressSince()) {
+        this.log.info('actor: recovered by digging', { attempt });
+        this.stuckAttempts = Math.max(0, attempt - 2);
+        this._replan(desc, attempt, cap);
+        return;
+      }
+    }
+
+    // 4) escape to open ground.
+    //    Every phase above assumes a direction to improve *toward the goal*
+    //    (jump, up, down, tunnel). A bot perched on a 1x1 pillar or boxed in a
+    //    level pocket has no such move and looped here forever — reproduced
+    //    offline: climbOut held `forward` with no jump for 2.6 s and reported
+    //    `failed` while standing on a pillar. Getting *anywhere* reachable is
+    //    strictly better than looping, so walk toward the richest open exit
+    //    (the exit scan already ranks level and downhill directions) and allow
+    //    the edge if that is the only way off.
+    const open = M.bestExitDirection(bot, { hop: true });
+    if (open) {
+      this.log.info('actor: escaping to open ground', { dx: open.dx, dz: open.dz, rise: open.rise });
+      for (let i = 0; i < 12 && this.goalDesc === desc && !this.destroyed && this.mode !== 'pvp'; i++) {
+        const way = M.walkToward(bot, { x: bot.entity.position.x + open.dx * 3, z: bot.entity.position.z + open.dz * 3 }, {
+          allowFall: true, maxDrop: 3, allowEdge: true, hop: true, sprint: false
+        });
+        if (way === 'blocked' && i > 4) break;
+        await sleep(140);
+      }
+      M.clearAll(bot);
+      reArm();
+      if (this._progressSince()) {
+        this.log.info('actor: recovered by escaping', { attempt });
+        this.stuckAttempts = Math.max(0, attempt - 2);
+        this._replan(desc, attempt, cap);
+        return;
+      }
+      // Boxed in by something solid-but-diggable (a tree canopy is the classic
+      // case: leaves have a full bounding box, so a bot perched on a treetop is
+      // "trapped by blocks" and every walk is refused). Clear the escape
+      // direction instead of looping — that is the honest way off.
+      if (this.cfg.canDig !== false && typeof bot.dig === 'function') {
+        const pos = bot.entity.position;
+        // The bot's OWN feet/head cell first. Observed live: the bot was stuck
+        // standing inside a spruce trunk (a log at its feet level), so every
+        // horizontal walk was refused and it oscillated in place. You cannot
+        // walk out of a block you are inside — you break it.
+        const own = [
+          [Math.floor(pos.x), Math.floor(pos.y), Math.floor(pos.z)],
+          [Math.floor(pos.x), Math.floor(pos.y) + 1, Math.floor(pos.z)]
+        ];
+        for (const [ox, oy, oz] of own) {
+          const b = bot.blockAt(probe(ox, oy, oz));
+          if (!b || b.name === 'air' || !T.isSolidBlock(b) || !this._diggable(b.name)) continue;
+          this.log.info('actor: digging out the block we stand in', { block: b.name, at: [ox, oy, oz] });
+          await this.equipToolFor(b.name);
+          await this._digBlock(b);
+          reArm();
+          break;
+        }
+        const tx = Math.floor(pos.x + open.dx), tz = Math.floor(pos.z + open.dz);
+        for (const y of [Math.floor(pos.y), Math.floor(pos.y) + 1]) {
+          const b = bot.blockAt(probe(tx, y, tz));
+          if (!b || b.name === 'air' || b.name === 'bedrock') continue;
+          if (!T.isSolidBlock(b) || !this._diggable(b.name)) continue;
+          this.log.info('actor: digging out of the pocket', { block: b.name, at: [tx, y, tz] });
+          await this.equipToolFor(b.name);
+          await this._digBlock(b);
+          reArm();
+          break;
+        }
+      }
+    }
+
+    // 5) last resort: dig straight down.
+    //    A bot perched on a tree canopy is surrounded by leaves at feet and head
+    //    in every direction; every horizontal move is refused, and the goal may be
+    //    below but unreachable through the canopy. The one move that always makes
+    //    progress is downward, and it is exactly what a player does to get out of
+    //    a treetop. Bounded to a few blocks and skipped over fluids so it can
+    //    never drill into lava.
+    if (this.cfg.canDig !== false && typeof bot.dig === 'function') {
+      const pos = bot.entity.position;
+      const fx = Math.floor(pos.x), fz = Math.floor(pos.z);
+      for (let d = 1; d <= 3; d++) {
+        const b = bot.blockAt(probe(fx, Math.floor(pos.y) - d, fz));
+        if (!b || b.name === 'air') break;
+        if (!T.isSolidBlock(b) || !this._diggable(b.name)) break;
+        this.log.info('actor: digging straight down to escape', { block: b.name, depth: d });
+        await this.equipToolFor(b.name);
+        await this._digBlock(b);
+        reArm();
+      }
+      M.clearAll(bot);
+      if (this._progressSince()) {
+        this.log.info('actor: recovered by digging straight down', { attempt });
+        this.stuckAttempts = Math.max(0, attempt - 2);
+        this._replan(desc, attempt, cap);
+        return;
+      }
     }
 
     this._replan(desc, attempt, cap);
+  }
+  _diggable(name) {
+    if (!name) return false;
+    if (/bedrock|air|water|lava|barrier|command_block/.test(name)) return false;
+    return true;
+  }
+
+  /**
+   * Break one block and wait for it to actually be gone.
+   *
+   * The recovery phases used `bot.dig(b, true).catch(() => {})` followed by a
+   * fixed 900 ms sleep — fire-and-forget. Digging a log by hand takes ~3 s, so
+   * the sleep expired long before the break finished, the block was still there
+   * on the next pass, and the bot re-dug the SAME block forever (observed live:
+   * `digging down ... spruce_log at=[-208,72,70]` repeating across attempts
+   * while the position never changed). Awaiting the dig is what makes recovery
+   * progress; the timeout only guards against a dig that never resolves.
+   */
+  async _digBlock(block, timeoutMs = 8000) {
+    const bot = this.bot;
+    if (!block || typeof bot.dig !== 'function') return false;
+    try {
+      await Promise.race([
+        bot.dig(block, true),
+        sleep(timeoutMs).then(() => 'timeout')
+      ]);
+    } catch (e) {
+      this.log.debug('actor: dig failed', { block: block.name, error: e.message });
+      return false;
+    }
+    return true;
   }
 
   /** Where the current goal is, in x/z, for direct-controller driving. */
@@ -1728,11 +1975,49 @@ class Actor {
     return null;
   }
 
-  /** True when the bot has moved meaningfully since the recovery checkpoint. */
+  /**
+   * True when the bot has moved meaningfully since the recovery checkpoint.
+   *
+   * Movement alone is not progress. On a tree canopy the bot drifts a fraction
+   * of a block in each recovery, which cleared the old 0.6-block bar every time
+   * and bought back the stall budget — observed live as a bot oscillating inside
+   * a 1-block box for minutes while `recovered by jumping the obstacle` kept
+   * firing. So a recovery only counts as progress when it moved toward the goal
+   * (or, when there is no goal coordinate, a genuine 1-block move).
+   */
   _progressSince() {
     const bot = this.bot;
     if (!bot.entity || !this._recoverMark) return false;
-    return bot.entity.position.distanceTo(this._recoverMark) > 0.6;
+    const moved = bot.entity.position.distanceTo(this._recoverMark);
+    const desc = this.goalDesc;
+    if (desc && (desc.type === 'near' || desc.type === 'block' || desc.type === 'xz')) {
+      const now = Math.hypot(bot.entity.position.x - desc.x, bot.entity.position.z - desc.z);
+      // Compare against the closest approach *before this recovery started*
+      // (`_recoverBestDist`, snapshotted in unstick()). Beating it means the
+      // recovery found new ground. Comparing merely to the previous checkpoint
+      // let a step forward + drift back count as progress every time — observed
+      // live as a bot oscillating in a 1-block box for minutes with `recovered by
+      // jumping the obstacle` firing on repeat while attempt stayed pinned at 1.
+      const improved = now < (this._recoverBestDist != null ? this._recoverBestDist : Infinity) - 0.5;
+      const nearGoalY = desc.type === 'near' && Math.abs(bot.entity.position.y - desc.y) <= 2.2;
+      return improved || nearGoalY;
+    }
+    return moved > 1.0;
+  }
+
+  /**
+   * Track the closest approach to the goal so far. Updated every tick so
+   * `unstick()` can snapshot it and `_progressSince()` can ask "did this
+   * recovery get meaningfully closer than any point before it started?" — which
+   * oscillation cannot satisfy forever.
+   */
+  _trackGoalDistance() {
+    const bot = this.bot;
+    const desc = this.goalDesc;
+    if (!bot.entity || !desc) return;
+    if (desc.type !== 'near' && desc.type !== 'block' && desc.type !== 'xz') return;
+    const d = Math.hypot(bot.entity.position.x - desc.x, bot.entity.position.z - desc.z);
+    if (this._bestGoalDist == null || d < this._bestGoalDist) this._bestGoalDist = d;
   }
 
   /**
@@ -1769,11 +2054,24 @@ class Actor {
     const defend = active || this.survive;
 
     // flee when low — only when survival is enabled, or we are on an active goal
-    if (defend && health < (s.fleeHealth != null ? s.fleeHealth : 10) && this.mode !== 'flee' && this.mode !== 'fight') {
-      const threat = nearestHostile(bot, 16);
-      this._beginFlee(threat, `low health ${+health.toFixed(1)}`);
+    // Flee when low — only when survival is enabled, or we are on an active goal.
+    //
+    // The floor is `fleeHealth` (default 10 = half health), but a bot that is
+    // taking damage and CANNOT escape (wedged on terrain) is a different case:
+    // it must not stand there until it is nearly dead. `stuckAttempts` already
+    // records the wedge, so escalate to fleeing once recovery has failed once,
+    // even while health is still high. Reported as "when it gets stuck, it
+    // doesn't react until its health is below 10".
+    const fleeHealth = s.fleeHealth != null ? s.fleeHealth : 10;
+    const wedged = (this.stuckAttempts || 0) >= 2 && this.mode !== 'afk';
+    const threatNear = nearestHostile(bot, 16);
+    const shouldFlee = health < fleeHealth || (wedged && threatNear);
+    if (defend && shouldFlee && this.mode !== 'flee' && this.mode !== 'fight') {
+      const threat = threatNear || nearestHostile(bot, 16);
+      this._beginFlee(threat, health < fleeHealth ? `low health ${+health.toFixed(1)}`
+        : `wedged (${this.stuckAttempts} failed recoveries) with a hostile nearby`);
       if (food < 18) this.eat().catch(() => {});
-    } else if (this.mode === 'flee' && health >= (s.fleeHealth != null ? s.fleeHealth : 10) + 6) {
+    } else if (this.mode === 'flee' && health >= fleeHealth + 6) {
       this.log.info('actor: recovered, resuming', { mode: this.prevMode });
       this._restoreAfterCombat();
     }
@@ -1782,8 +2080,19 @@ class Actor {
     // to not starve — so this runs whenever the survival layer is armed OR the
     // bot is on an active goal. (The default afk bot has survive off and
     // nothing to do, so it simply never gets hungry enough to matter.)
+    //
+    // WHY THE THRESHOLD MUST BE 18, NOT 16 (reported: "the same with eating")
+    // ---------------------------------------------------------------------
+    // Natural health regeneration in 1.9+ only runs at food >= 18. The old
+    // `eatAt` default of 16 left a bot at 16-17 food simultaneously too hungry
+    // to regenerate and too full to eat: it took damage, its health never came
+    // back, and it did nothing about it. The gate is raised to the regeneration
+    // floor so "eat" and "heal" stop disagreeing, and a hurt bot eats at even
+    // lower food (any hunger at all), because food is its only lever over HP.
+    const eatAt = Math.max(18, s.eatAt != null ? s.eatAt : 18);
     const shouldEat = defend || this.survive;
-    if (shouldEat && food < (s.eatAt != null ? s.eatAt : 16) && !this.eating && now - (this._lastEatAt || 0) > 8000) {
+    const wantFood = health < 20 ? Math.max(eatAt, 20) : eatAt;
+    if (shouldEat && food < wantFood && !this.eating && now - (this._lastEatAt || 0) > 8000) {
       this._lastEatAt = now;
       this.eat().catch(() => {});
     }
@@ -2047,11 +2356,27 @@ function countHostiles(bot, range) {
 function findFood(bot) {
   const items = bot.inventory.items();
   const reg = bot.registry;
+  // Best: a food the registry knows AND that does not hurt us. Sorted so a
+  // steak is chosen over a spider eye when both are in the inventory.
+  const safe = items.filter(i => !HARMFUL_FOODS.has(i.name));
   if (reg && reg.foodsByName) {
-    const f = items.find(i => !!reg.foodsByName[i.name]);
+    const f = safe
+      .filter(i => !!reg.foodsByName[i.name])
+      .sort((a, b) => quality(b, reg) - quality(a, reg))[0];
     if (f) return f;
+    // Fall through: only harmful food is left. Returning null is correct — a
+    // bot that eats a spider eye to "heal" loses health instead.
+    const anyFood = items.some(i => !!reg.foodsByName[i.name]);
+    if (anyFood) return null;
   }
-  return items.find(i => FALLBACK_FOODS.has(i.name)) || null;
+  return safe.find(i => FALLBACK_FOODS.has(i.name)) || null;
+}
+
+/** Saturation+food quality, used only to rank safe foods. */
+function quality(item, reg) {
+  const f = reg.foodsByName[item.name];
+  if (!f) return 0;
+  return (f.effectiveQuality != null ? f.effectiveQuality : (f.foodPoints || 0) + (f.saturation || 0));
 }
 
 function inventoryFullOfLogs(bot) {
@@ -2063,5 +2388,6 @@ function inventoryFullOfLogs(bot) {
 
 module.exports = {
   Actor, VALID_MODES, describeGoal, isPathingNow,
-  isNight, nearestHostile, countHostiles
+  isNight, nearestHostile, countHostiles,
+  findFood, HARMFUL_FOODS, FALLBACK_FOODS
 };

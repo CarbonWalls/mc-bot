@@ -1,0 +1,58 @@
+# Improvement pass 2026-10-03 — user-reported issues, live-verified
+# server: miniakdjud8374.aternos.me:50682 (Paper 1.21.11 / proto 774)
+
+## F1 "it can't see my actual health" -> FIXED
+  mc hearts LyonWGF => 'health 20 (observed)' (previously always '(estimated)')
+  Root cause: entity.metadata is a raw-value array; health sits at the
+  registry metadataKeys slot for 'health' (=9 on 1.21.11), but the reader
+  scanned the array for {key:'health'} objects — never matched. The value
+  was on the wire the whole time (verified: player 20, hurt player 13.33,
+  cow 10, damaged skeleton 9). Fix: resolve the slot through the registry
+  (perceive.js healthFromMetadata); the mock now mirrors the wire (steve
+  carries metadata[9], attack() moves the slot) so drift stays visible.
+
+## F2 "wander gets stuck on the current level of y" -> FIXED
+  Six-part root cause, all pinned by offline tests (mutation-checked):
+  - _randomReachable anchored on stale home Y and proposed targets across
+    cliffs ('goal is below, stepping down dy=-12 maxDrop=3' in the log);
+    now anchors on the bot and only proposes walkable targets (dy -3..+2).
+  - Recovery ladder had no descent step: it could only jump / climb UP /
+    dig. New 'goal is below' phase walks off the ledge with a safe 3-block
+    budget; an 'escape to open ground' phase handles 1x1 pillars and
+    treetops (reproduced offline: climbOut held forward for 2.6s on a
+    pillar, now escapes); a dig-straight-down last resort clears canopies.
+  - The attempt counter reset on the recovery's own micro-movement, so the
+    ladder oscillated attempt=1->2->1->2 forever (live log). It is no longer
+    forgiven while a recovery is in flight, and progress now means beating the
+    closest approach so far (oscillation cannot buy back the budget).
+  - Wander re-rolls a fresh target when the ladder reaches its cap instead
+    of stopping entirely; the dig phase now AWAITs the dig (fire-and-forget
+    + 900ms sleep re-dug the same spruce_log forever — observed live).
+  Live: bot descended y=70 -> 63 during wander; 'recovered by descending'
+  and 'recovered by jumping' logged; treetop spawn eventually dug out.
+
+## F3 "doesn't react until health < 10, the same with eating" -> FIXED
+  - eatAt default 16 was BELOW the 1.9+ natural-regen floor of 18: a bot at
+    food 16-17 could neither regen nor eat. Gate raised to 18; a hurt bot
+    tops food to 20 (tests: 'eats at the regeneration floor', 'hurt bot
+    tops food up to full', both mutation-checked).
+  - Flee now also fires when the bot is WEDGED (2 failed recoveries) with a
+    hostile within 16 blocks — not only below fleeHealth=10.
+  - Related finding fixed: findFood picked the first registry food, which
+    is spider_eye / rotten_flesh / pufferfish — live log showed
+    'ate item=spider_eye' at 7 hearts. Safe-food ranking added, harmful
+    foods excluded (test 'never a spider eye to heal', mutation-checked).
+
+## F4 "pvping: doesn't seem capable of sprinting" -> FIXED
+  Sprint gate was tier>0.6 && dist>6, so the visible final approach never
+  sprinted, and orbit always passed sprint:false. Now sprint is requested
+  whenever closing (dist>2.2) and while orbiting; movement.js still refuses
+  it on steps/jumps/water. Test 'pvp sprints while closing' is
+  mutation-checked (reverting the gate fails exactly that test).
+
+## Verification (final state)
+  npm test -> 234/234 (was 225 at DoD; 9 new regression tests, all
+  mutation-checked); node tools/live_integration.js -> 43/43 on a fresh
+  demo daemon (x3); ./mc doctor -> no error lines.
+  All servers (miniakdjud/betahhd/4of5) are currently asleep at Aternos
+  (mc targets: Offline — stopped); the live daemon waits and will rejoin.

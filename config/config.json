@@ -1,8 +1,8 @@
 {
-  "host": "betahhd.aternos.me",
-  "port": 49851,
-  "bedrockHost": "betahhd.aternos.me",
-  "bedrockPort": 49851,
+  "host": "miniakdjud8374.aternos.me",
+  "port": 50682,
+  "bedrockHost": "miniakdjud8374.aternos.me",
+  "bedrockPort": 50682,
   "username": "AFK_Bot",
   "version": "auto",
   "auth": "offline",
@@ -27,7 +27,7 @@
     "mode": "afk",
     "survive": {
       "enabled": false,
-      "eatAt": 16,
+      "eatAt": 18,
       "fleeHealth": 10,
       "nightFleeRadius": 12,
       "attack": true,
@@ -61,12 +61,12 @@
     "statusFile": "logs/status.json"
   },
   "_verifiedTarget": {
-    "host": "betahhd.aternos.me",
-    "port": 49851,
+    "host": "miniakdjud8374.aternos.me",
+    "port": 50682,
     "protocol": 774,
     "versionName": "Paper 1.21.11",
     "how": "mc targets (probeServer + minecraft-data data dir)",
     "note": "re-verify with `mc targets`; Aternos rotates names and owners upgrade Paper",
-    "verifiedAt": "2026-10-02T22:46:13.938Z"
+    "verifiedAt": "2026-10-03T21:11:37.000Z"
   }
 }
